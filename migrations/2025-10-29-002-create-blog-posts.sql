@@ -1,0 +1,19 @@
+CREATE TABLE IF NOT EXISTS `blog_posts` (
+  `id` INT NOT NULL AUTO_INCREMENT,
+  `title` VARCHAR(255) NOT NULL,
+  `slug` VARCHAR(255) NOT NULL UNIQUE,
+  `excerpt` TEXT NOT NULL,
+  `content` LONGTEXT NOT NULL,
+  `cover_image` VARCHAR(512) DEFAULT NULL,
+  `author_id` INT DEFAULT NULL,
+  `published_date` DATE NOT NULL,
+  `is_published` TINYINT(1) NOT NULL DEFAULT 1,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_blog_author` (`author_id`),
+  CONSTRAINT `fk_blog_author`
+    FOREIGN KEY (`author_id`) REFERENCES `admins`(`id`)
+    ON UPDATE CASCADE
+    ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

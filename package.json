@@ -1,0 +1,37 @@
+{
+  "name": "csam-backend",
+  "version": "1.0.0",
+  "description": "Backend API for CSAM Zaccaria TVET School",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "migrate": "node migrate.js",
+    "test-email": "node scripts/test-email.js",
+    "setup-email": "node scripts/setup-email.js"
+  },
+  "keywords": [
+    "express",
+    "mysql",
+    "authentication"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "africastalking": "^0.7.7",
+    "axios": "^1.12.2",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.21.2",
+    "express-validator": "^7.0.1",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^7.0.0",
+    "multer": "^2.0.2",
+    "mysql2": "^3.6.5",
+    "nodemailer": "^7.0.9"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
