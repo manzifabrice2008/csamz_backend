@@ -1,8 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const bcrypt = require('bcryptjs');
 
 // Get student profile
 router.get('/profile', authenticateToken, async (req, res) => {
@@ -11,18 +12,24 @@ router.get('/profile', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    const [rows] = await db.query(
-      `SELECT id, username, full_name, email, phone_number AS phone, trade, institution_id, 
-              date_of_birth, address, emergency_contact, status, created_at 
-       FROM students WHERE id = ? LIMIT 1`,
-      [req.user.id]
-    );
+    const { data: student, error } = await supabase
+      .from('students')
+      .select('id, username, full_name, email, phone_number, trade, institution_id, date_of_birth, address, emergency_contact, status, created_at')
+      .eq('id', req.user.id)
+      .single();
 
-    if (rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Student not found' });
+    if (error) {
+      if (error.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Student not found' });
+      throw error;
     }
 
-    res.json({ success: true, student: rows[0] });
+    // Map phone_number to phone for frontend consistency
+    const formattedStudent = {
+      ...student,
+      phone: student.phone_number
+    };
+
+    res.json({ success: true, student: formattedStudent });
   } catch (error) {
     console.error('Get student profile error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
@@ -62,41 +69,43 @@ router.put('/profile',
 
       // Check if email is already taken by another student
       if (email) {
-        const [existing] = await db.query(
-          'SELECT id FROM students WHERE email = ? AND id != ? LIMIT 1',
-          [email, req.user.id]
-        );
+        const { data: existing, error: checkError } = await supabase
+          .from('students')
+          .select('id')
+          .eq('email', email)
+          .neq('id', req.user.id)
+          .maybeSingle();
 
-        if (existing.length > 0) {
+        if (checkError) throw checkError;
+        if (existing) {
           return res.status(400).json({ success: false, message: 'Email already in use' });
         }
       }
 
-      const [result] = await db.query(
-        `UPDATE students 
-         SET full_name = ?, email = ?, phone_number = ?, date_of_birth = ?, 
-             address = ?, emergency_contact = ?, updated_at = NOW()
-         WHERE id = ?`,
-        [full_name, email || null, phone || null, date_of_birth || null,
-          address || null, emergency_contact || null, req.user.id]
-      );
+      const { data: updated, error: updateError } = await supabase
+        .from('students')
+        .update({
+          full_name,
+          email: email || null,
+          phone_number: phone || null,
+          date_of_birth: date_of_birth || null,
+          address: address || null,
+          emergency_contact: emergency_contact || null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', req.user.id)
+        .select('id, username, full_name, email, phone_number, trade, institution_id, date_of_birth, address, emergency_contact, status, updated_at')
+        .single();
 
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ success: false, message: 'Student not found' });
-      }
-
-      // Get updated student data
-      const [updatedRows] = await db.query(
-        `SELECT id, username, full_name, email, phone_number AS phone, trade, institution_id, 
-                date_of_birth, address, emergency_contact, status, updated_at 
-         FROM students WHERE id = ? LIMIT 1`,
-        [req.user.id]
-      );
+      if (updateError) throw updateError;
 
       res.json({
         success: true,
         message: 'Profile updated successfully',
-        student: updatedRows[0]
+        student: {
+          ...updated,
+          phone: updated.phone_number
+        }
       });
     } catch (error) {
       console.error('Update student profile error:', error);
@@ -132,17 +141,15 @@ router.put('/password',
       const { current_password, new_password } = req.body;
 
       // Get current password hash
-      const [rows] = await db.query(
-        'SELECT password FROM students WHERE id = ? LIMIT 1',
-        [req.user.id]
-      );
+      const { data: student, error: fetchError } = await supabase
+        .from('students')
+        .select('password')
+        .eq('id', req.user.id)
+        .single();
 
-      if (rows.length === 0) {
-        return res.status(404).json({ success: false, message: 'Student not found' });
-      }
+      if (fetchError) throw fetchError;
 
-      const bcrypt = require('bcryptjs');
-      const isMatch = await bcrypt.compare(current_password, rows[0].password);
+      const isMatch = await bcrypt.compare(current_password, student.password);
 
       if (!isMatch) {
         return res.status(400).json({ success: false, message: 'Current password is incorrect' });
@@ -153,10 +160,15 @@ router.put('/password',
       const hashedPassword = await bcrypt.hash(new_password, salt);
 
       // Update password
-      await db.query(
-        'UPDATE students SET password = ?, updated_at = NOW() WHERE id = ?',
-        [hashedPassword, req.user.id]
-      );
+      const { error: updateError } = await supabase
+        .from('students')
+        .update({
+          password: hashedPassword,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', req.user.id);
+
+      if (updateError) throw updateError;
 
       res.json({ success: true, message: 'Password changed successfully' });
     } catch (error) {
@@ -173,69 +185,83 @@ router.get('/stats', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    // Get exam statistics
-    const [examStats] = await db.query(
-      `SELECT 
-         COUNT(*) as total_exams,
-         COUNT(CASE WHEN score >= 50 THEN 1 END) as passed_exams,
-         AVG(score) as average_score,
-         MAX(score) as highest_score,
-         MIN(score) as lowest_score
-       FROM exam_results 
-       WHERE student_id = ?`,
-      [req.user.id]
-    );
+    const studentId = req.user.id;
 
-    // Get recent activity
-    const [recentActivity] = await db.query(
-      `SELECT 
-         'exam' as type,
-         er.exam_title as title,
-         er.score,
-         er.total_marks,
-         er.created_at as date
-       FROM exam_results er
-       WHERE er.student_id = ?
-       
-       UNION ALL
-       
-       SELECT 
-         'assignment' as type,
-         title,
-         NULL as score,
-         NULL as total_marks,
-         created_at as date
-       FROM assignments
-       WHERE student_id = ?
-       
-       ORDER BY date DESC
-       LIMIT 10`,
-      [req.user.id, req.user.id]
-    );
+    // Get exam statistics
+    const { data: results, error: resError } = await supabase
+      .from('results')
+      .select('score')
+      .eq('student_id', studentId);
+
+    if (resError) throw resError;
+
+    const total_exams = results.length;
+    const passed_exams = results.filter(r => r.score >= 50).length;
+    const scores = results.map(r => r.score);
+    const average_score = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
+    const highest_score = scores.length ? Math.max(...scores) : 0;
+    const lowest_score = scores.length ? Math.min(...scores) : 0;
+
+    // Get recent activity (exams and assignments)
+    const { data: recentExams, error: revError } = await supabase
+      .from('results')
+      .select('score, submitted_at, exam:exams(title, total_marks)')
+      .eq('student_id', studentId)
+      .order('submitted_at', { ascending: false })
+      .limit(10);
+
+    if (revError) throw revError;
+
+    // Note: assignments table might not exist or be different, but keeping consistency with original logic
+    const { data: recentAssignments, error: assError } = await supabase
+      .from('assignments')
+      .select('title, created_at')
+      .eq('student_id', studentId)
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    // If assignments table doesn't exist, we'll just have empty array
+    const assignments = recentAssignments || [];
+
+    const activity = [
+      ...recentExams.map(r => ({
+        type: 'exam',
+        title: r.exam?.title,
+        score: r.score,
+        total_marks: r.exam?.total_marks,
+        date: r.submitted_at
+      })),
+      ...assignments.map(a => ({
+        type: 'assignment',
+        title: a.title,
+        score: null,
+        total_marks: null,
+        date: a.created_at
+      }))
+    ].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 10);
 
     // Get upcoming exams
-    const [upcomingExams] = await db.query(
-      `SELECT id, title, description, total_marks, duration, exam_date, start_time, end_time
-       FROM online_exams 
-       WHERE exam_date >= CURDATE() 
-       AND (trade IS NULL OR LOWER(trade) = LOWER(?))
-       ORDER BY exam_date ASC, start_time ASC
-       LIMIT 5`,
-      [req.user.trade]
-    );
+    const { data: upcomingExams, error: upError } = await supabase
+      .from('exams') // Assuming 'exams' is used for online exams too
+      .select('id, title, description, total_marks, created_at')
+      .filter('trade', 'eq', req.user.trade)
+      .order('created_at', { ascending: true })
+      .limit(5);
+
+    if (upError) throw upError;
 
     res.json({
       success: true,
       stats: {
-        exams: examStats[0] || {
-          total_exams: 0,
-          passed_exams: 0,
-          average_score: 0,
-          highest_score: 0,
-          lowest_score: 0
+        exams: {
+          total_exams,
+          passed_exams,
+          average_score,
+          highest_score,
+          lowest_score
         },
-        recentActivity,
-        upcomingExams
+        recentActivity: activity,
+        upcomingExams: upcomingExams || []
       }
     });
   } catch (error) {

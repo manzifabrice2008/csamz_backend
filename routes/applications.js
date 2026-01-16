@@ -4,7 +4,7 @@ const { body, validationResult } = require('express-validator');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken: authMiddleware } = require('../middleware/auth');
 const smsService = require('../services/sms');
 const emailService = require('../services/email');
@@ -43,9 +43,8 @@ const upload = multer({
 
 // Custom middleware to handle multer errors
 const handleUpload = (req, res, next) => {
-  upload(req, res, function(err) {
+  upload(req, res, function (err) {
     if (err instanceof multer.MulterError) {
-      // A Multer error occurred when uploading
       let errorMessage = 'File upload error';
       if (err.code === 'LIMIT_FILE_SIZE') {
         errorMessage = 'File too large. Maximum file size is 20MB.';
@@ -58,13 +57,11 @@ const handleUpload = (req, res, next) => {
         code: err.code || 'UPLOAD_ERROR'
       });
     } else if (err) {
-      // An unknown error occurred
       return res.status(400).json({
         success: false,
         message: err.message || 'Error processing your request. Please try again.'
       });
     }
-    // Everything went fine, proceed to next middleware
     next();
   });
 };
@@ -73,36 +70,32 @@ const handleUpload = (req, res, next) => {
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const { status, program } = req.query;
-    
-    let query = `
-      SELECT 
-        sa.*,
-        a.username as approved_by_username,
-        a.full_name as approved_by_name
-      FROM student_applications sa
-      LEFT JOIN admins a ON sa.approved_by = a.id
-      WHERE 1=1
-    `;
-    const params = [];
 
-    if (status) {
-      query += ' AND sa.status = ?';
-      params.push(status);
-    }
+    let query = supabase
+      .from('student_applications')
+      .select('*, approved_by:admins(username, full_name)');
 
-    if (program) {
-      query += ' AND sa.program = ?';
-      params.push(program);
-    }
+    if (status) query = query.eq('status', status);
+    if (program) query = query.eq('program', program);
 
-    query += ' ORDER BY sa.created_at DESC';
+    query = query.order('created_at', { ascending: false });
 
-    const [applications] = await db.query(query, params);
+    const { data: applications, error } = await query;
+
+    if (error) throw error;
+
+    // Flatten join result for backward compatibility
+    const formattedApps = applications.map(app => ({
+      ...app,
+      approved_by_username: app.approved_by?.username || null,
+      approved_by_name: app.approved_by?.full_name || null,
+      approved_by: app.approved_by ? undefined : null // Clean up if joined, or null
+    }));
 
     res.json({
       success: true,
-      count: applications.length,
-      applications
+      count: formattedApps.length,
+      applications: formattedApps
     });
   } catch (error) {
     console.error('Get applications error:', error);
@@ -116,26 +109,32 @@ router.get('/', authMiddleware, async (req, res) => {
 // Get single application by ID (protected)
 router.get('/:id', authMiddleware, async (req, res) => {
   try {
-    const [applications] = await db.query(`
-      SELECT 
-        sa.*,
-        a.username as approved_by_username,
-        a.full_name as approved_by_name
-      FROM student_applications sa
-      LEFT JOIN admins a ON sa.approved_by = a.id
-      WHERE sa.id = ?
-    `, [req.params.id]);
+    const { data: application, error } = await supabase
+      .from('student_applications')
+      .select('*, approved_by:admins(username, full_name)')
+      .eq('id', req.params.id)
+      .single();
 
-    if (applications.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Application not found'
-      });
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({
+          success: false,
+          message: 'Application not found'
+        });
+      }
+      throw error;
     }
+
+    const formattedApp = {
+      ...application,
+      approved_by_username: application.approved_by?.username || null,
+      approved_by_name: application.approved_by?.full_name || null,
+      approved_by: application.approved_by ? undefined : null
+    };
 
     res.json({
       success: true,
-      application: applications[0]
+      application: formattedApp
     });
   } catch (error) {
     console.error('Get application error:', error);
@@ -148,16 +147,9 @@ router.get('/:id', authMiddleware, async (req, res) => {
 
 // Middleware to parse application submissions
 const parseApplicationSubmission = (req, res, next) => {
-  console.log('=== New Application Request ===');
-  console.log('Method:', req.method);
-  console.log('URL:', req.originalUrl);
-  console.log('Headers:', JSON.stringify(req.headers, null, 2));
-  console.log('Content-Type:', req.headers['content-type']);
-
   const contentType = req.headers['content-type'] || '';
 
   if (contentType.includes('application/json')) {
-    console.log('Processing as JSON request');
     return express.json()(req, res, (err) => {
       if (err) {
         console.error('Error parsing JSON:', err);
@@ -170,7 +162,6 @@ const parseApplicationSubmission = (req, res, next) => {
     });
   }
 
-  console.log('Processing as form data with potential file upload');
   return handleUpload(req, res, next);
 };
 
@@ -188,48 +179,16 @@ router.post('/',
   ],
   async (req, res) => {
     try {
-      console.log('=== Processing Application Request ===');
-      console.log('Request body:', JSON.stringify(req.body, null, 2));
-      
-      if (req.file) {
-        console.log('Uploaded file:', {
-          fieldname: req.file.fieldname,
-          originalname: req.file.originalname,
-          mimetype: req.file.mimetype,
-          size: req.file.size
-        });
-      } else {
-        console.log('No file uploaded');
-      }
-      
       // Validate request body
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        console.error('Validation errors:', errors.array());
         return res.status(400).json({
           success: false,
           message: 'Validation failed',
           errors: errors.array()
         });
       }
-      
-      // Ensure required fields are present
-      const requiredFields = [
-        'full_name', 'email', 'phone_number', 
-        'date_of_birth', 'gender', 'address', 'program'
-      ];
-      
-      const missingFields = requiredFields.filter(field => !req.body[field]);
-      if (missingFields.length > 0) {
-        console.error('Missing required fields:', missingFields);
-        return res.status(400).json({
-          success: false,
-          message: 'Missing required fields',
-          missingFields: missingFields
-        });
-      }
 
-      // Extract all fields from request body
       const {
         full_name,
         email,
@@ -244,15 +203,11 @@ router.post('/',
         guardian_phone
       } = req.body;
 
-      // Get the file path if a file was uploaded
       const reportPath = req.file ? `/uploads/applications/${req.file.filename}` : null;
 
-      const [result] = await db.query(
-        `INSERT INTO student_applications 
-        (full_name, email, phone_number, date_of_birth, gender, address, program, 
-         previous_school, previous_qualification, guardian_name, guardian_phone, report_path) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
+      const { data: result, error } = await supabase
+        .from('student_applications')
+        .insert([{
           full_name,
           email,
           phone_number,
@@ -260,15 +215,18 @@ router.post('/',
           gender,
           address,
           program,
-          previous_school || null,
-          previous_qualification || null,
-          guardian_name || null,
-          guardian_phone || null,
-          reportPath
-        ]
-      );
+          previous_school: previous_school || null,
+          previous_qualification: previous_qualification || null,
+          guardian_name: guardian_name || null,
+          guardian_phone: guardian_phone || null,
+          report_path: reportPath
+        }])
+        .select()
+        .single();
 
-      // Send confirmation email to student
+      if (error) throw error;
+
+      // Send confirmation emails (async)
       const studentData = {
         full_name,
         email,
@@ -276,30 +234,20 @@ router.post('/',
         program,
         date_of_birth,
         address,
-        has_report: !!reportPath
+        has_report: !!reportPath,
+        report_url: reportPath ? `${req.protocol}://${req.get('host')}${reportPath}` : null
       };
 
-      // Add report URL to response if file was uploaded
-      if (reportPath) {
-        studentData.report_url = `${req.protocol}://${req.get('host')}${reportPath}`;
-      }
-      
-      emailService.sendApplicationConfirmation(studentData).catch(err => {
-        console.error('Failed to send confirmation email:', err);
-      });
-
-      // Send notification to admin
-      emailService.sendAdminNotification(studentData).catch(err => {
-        console.error('Failed to send admin notification:', err);
-      });
+      emailService.sendApplicationConfirmation(studentData).catch(err => console.error('Email error:', err));
+      emailService.sendAdminNotification(studentData).catch(err => console.error('Admin email error:', err));
 
       res.status(201).json({
         success: true,
         message: 'Application submitted successfully',
-        applicationId: result.insertId,
+        applicationId: result.id,
         hasReport: !!reportPath,
         application: {
-          id: result.insertId,
+          id: result.id,
           full_name,
           email,
           phone_number,
@@ -309,17 +257,15 @@ router.post('/',
       });
     } catch (error) {
       console.error('Create application error:', error);
-      // Clean up uploaded file if there was an error after file upload
       if (req.file && req.file.path) {
         fs.unlink(req.file.path, (unlinkErr) => {
           if (unlinkErr) console.error('Error cleaning up file:', unlinkErr);
         });
       }
-      
+
       res.status(500).json({
         success: false,
-        message: error.message || 'Server error while submitting application',
-        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        message: error.message || 'Server error while submitting application'
       });
     }
   }
@@ -346,48 +292,48 @@ router.patch('/:id/status',
       const applicationId = req.params.id;
       const adminId = req.user.id;
 
-      // Check if application exists
-      const [existingApp] = await db.query(
-        'SELECT * FROM student_applications WHERE id = ?',
-        [applicationId]
-      );
+      // Check existence and get data
+      const { data: application, error: fetchError } = await supabase
+        .from('student_applications')
+        .select('*')
+        .eq('id', applicationId)
+        .single();
 
-      if (existingApp.length === 0) {
-        return res.status(404).json({
-          success: false,
-          message: 'Application not found'
-        });
+      if (fetchError) {
+        if (fetchError.code === 'PGRST116') {
+          return res.status(404).json({
+            success: false,
+            message: 'Application not found'
+          });
+        }
+        throw fetchError;
       }
 
-      const application = existingApp[0];
+      // Update application
+      const { data: updatedApp, error: updateError } = await supabase
+        .from('student_applications')
+        .update({
+          status,
+          admin_notes: admin_notes || null,
+          approved_by: adminId,
+          approved_at: new Date().toISOString()
+        })
+        .eq('id', applicationId)
+        .select()
+        .single();
 
-      // Update application status
-      await db.query(
-        `UPDATE student_applications 
-         SET status = ?, admin_notes = ?, approved_by = ?, approved_at = NOW() 
-         WHERE id = ?`,
-        [status, admin_notes || null, adminId, applicationId]
-      );
+      if (updateError) throw updateError;
 
-      // Get updated application
-      const [updatedApp] = await db.query(
-        'SELECT * FROM student_applications WHERE id = ?',
-        [applicationId]
-      );
-
-      // Send email notification for status update
+      // Notifications
       const studentData = {
         full_name: application.full_name,
         email: application.email,
         phone_number: application.phone_number,
         program: application.program
       };
-      
-      emailService.sendApplicationStatusUpdate(studentData, status, admin_notes).catch(err => {
-        console.error('Failed to send status update email:', err);
-      });
 
-      // Send SMS notification if status is approved or rejected
+      emailService.sendApplicationStatusUpdate(studentData, status, admin_notes).catch(err => console.error('Status update email failed:', err));
+
       let smsResult = { success: false };
       if (status === 'approved' || status === 'rejected') {
         try {
@@ -405,8 +351,8 @@ router.patch('/:id/status',
 
       res.json({
         success: true,
-        message: `Application ${status} successfully. Email notification sent.`,
-        application: updatedApp[0],
+        message: `Application ${status} successfully.`,
+        application: updatedApp,
         sms_sent: smsResult.success,
         sms_provider: smsResult.provider
       });
@@ -423,14 +369,13 @@ router.patch('/:id/status',
 // Delete application (protected - admin only)
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
-    const applicationId = req.params.id;
+    const { error, count } = await supabase
+      .from('student_applications')
+      .delete({ count: 'exact' })
+      .eq('id', req.params.id);
 
-    const [result] = await db.query(
-      'DELETE FROM student_applications WHERE id = ?',
-      [applicationId]
-    );
-
-    if (result.affectedRows === 0) {
+    if (error) throw error;
+    if (count === 0) {
       return res.status(404).json({
         success: false,
         message: 'Application not found'
@@ -453,28 +398,36 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 // Get application statistics (protected - admin only)
 router.get('/stats/overview', authMiddleware, async (req, res) => {
   try {
-    const [stats] = await db.query(`
-      SELECT 
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-        SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
-        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected
-      FROM student_applications
-    `);
+    // We can use RPC or run multiple counts
+    const { data: applications, error } = await supabase
+      .from('student_applications')
+      .select('status, program');
 
-    const [programStats] = await db.query(`
-      SELECT 
-        program,
-        COUNT(*) as count,
-        SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved_count
-      FROM student_applications
-      GROUP BY program
-      ORDER BY count DESC
-    `);
+    if (error) throw error;
+
+    const stats = {
+      total: applications.length,
+      pending: applications.filter(a => a.status === 'pending').length,
+      approved: applications.filter(a => a.status === 'approved').length,
+      rejected: applications.filter(a => a.status === 'rejected').length
+    };
+
+    const programMap = {};
+    applications.forEach(a => {
+      if (!programMap[a.program]) {
+        programMap[a.program] = { program: a.program, count: 0, approved_count: 0 };
+      }
+      programMap[a.program].count++;
+      if (a.status === 'approved') {
+        programMap[a.program].approved_count++;
+      }
+    });
+
+    const programStats = Object.values(programMap).sort((a, b) => b.count - a.count);
 
     res.json({
       success: true,
-      stats: stats[0],
+      stats,
       programStats
     });
   } catch (error) {

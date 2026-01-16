@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken: authMiddleware } = require('../middleware/auth');
 
 const parseBoolean = (value, defaultValue = true) => {
@@ -26,7 +26,7 @@ const mapBlogPost = (row) => ({
   content: row.content,
   cover_image: row.cover_image,
   author_id: row.author_id,
-  author_name: row.author_name ?? row.author_full_name ?? null,
+  author_name: row.author?.full_name || row.author_name || null,
   published_date: row.published_date,
   is_published: Boolean(row.is_published),
   created_at: row.created_at,
@@ -36,18 +36,18 @@ const mapBlogPost = (row) => ({
 // Public: list published blog posts
 router.get('/', async (req, res) => {
   try {
-    const [rows] = await db.query(
-      `SELECT b.*, a.full_name AS author_name
-       FROM blog_posts b
-       LEFT JOIN admins a ON b.author_id = a.id
-       WHERE b.is_published = TRUE
-       ORDER BY b.published_date DESC, b.created_at DESC`
-    );
+    const { data: posts, error } = await supabase
+      .from('blog_posts')
+      .select('*, author:admins(full_name)')
+      .eq('is_published', true)
+      .order('published_date', { ascending: false });
+
+    if (error) throw error;
 
     res.json({
       success: true,
-      count: rows.length,
-      posts: rows.map(mapBlogPost),
+      count: posts.length,
+      posts: posts.map(mapBlogPost),
     });
   } catch (error) {
     console.error('List blog posts error:', error);
@@ -61,17 +61,17 @@ router.get('/', async (req, res) => {
 // Admin: list all posts (including drafts)
 router.get('/admin', authMiddleware, async (req, res) => {
   try {
-    const [rows] = await db.query(
-      `SELECT b.*, a.full_name AS author_name
-       FROM blog_posts b
-       LEFT JOIN admins a ON b.author_id = a.id
-       ORDER BY b.published_date DESC, b.created_at DESC`
-    );
+    const { data: posts, error } = await supabase
+      .from('blog_posts')
+      .select('*, author:admins(full_name)')
+      .order('published_date', { ascending: false });
+
+    if (error) throw error;
 
     res.json({
       success: true,
-      count: rows.length,
-      posts: rows.map(mapBlogPost),
+      count: posts.length,
+      posts: posts.map(mapBlogPost),
     });
   } catch (error) {
     console.error('Admin list blog posts error:', error);
@@ -85,24 +85,22 @@ router.get('/admin', authMiddleware, async (req, res) => {
 // Admin: get by id
 router.get('/admin/:id', authMiddleware, async (req, res) => {
   try {
-    const [rows] = await db.query(
-      `SELECT b.*, a.full_name AS author_name
-       FROM blog_posts b
-       LEFT JOIN admins a ON b.author_id = a.id
-       WHERE b.id = ?`,
-      [req.params.id]
-    );
+    const { data: post, error } = await supabase
+      .from('blog_posts')
+      .select('*, author:admins(full_name)')
+      .eq('id', req.params.id)
+      .single();
 
-    if (rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Blog post not found',
-      });
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ success: false, message: 'Blog post not found' });
+      }
+      throw error;
     }
 
     res.json({
       success: true,
-      post: mapBlogPost(rows[0]),
+      post: mapBlogPost(post),
     });
   } catch (error) {
     console.error('Admin get blog post error:', error);
@@ -116,24 +114,23 @@ router.get('/admin/:id', authMiddleware, async (req, res) => {
 // Public: get by slug
 router.get('/:slug', async (req, res) => {
   try {
-    const [rows] = await db.query(
-      `SELECT b.*, a.full_name AS author_name
-       FROM blog_posts b
-       LEFT JOIN admins a ON b.author_id = a.id
-       WHERE b.slug = ? AND b.is_published = TRUE`,
-      [req.params.slug]
-    );
+    const { data: post, error } = await supabase
+      .from('blog_posts')
+      .select('*, author:admins(full_name)')
+      .eq('slug', req.params.slug)
+      .eq('is_published', true)
+      .single();
 
-    if (rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Blog post not found',
-      });
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ success: false, message: 'Blog post not found' });
+      }
+      throw error;
     }
 
     res.json({
       success: true,
-      post: mapBlogPost(rows[0]),
+      post: mapBlogPost(post),
     });
   } catch (error) {
     console.error('Get blog post error:', error);
@@ -169,37 +166,31 @@ router.post('/', authMiddleware, blogValidators, async (req, res) => {
     const { title, slug, excerpt, content, cover_image, published_date, is_published } = req.body;
     const authorId = req.user?.id ?? null;
 
-    const [result] = await db.query(
-      `INSERT INTO blog_posts (title, slug, excerpt, content, cover_image, author_id, published_date, is_published)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
+    const { data: newPost, error } = await supabase
+      .from('blog_posts')
+      .insert([{
         title,
         slug,
         excerpt,
         content,
-        cover_image || null,
-        authorId,
+        cover_image: cover_image || null,
+        author_id: authorId,
         published_date,
-        parseBoolean(is_published, true) ? 1 : 0,
-      ]
-    );
+        is_published: parseBoolean(is_published, true)
+      }])
+      .select('*, author:admins(full_name)')
+      .single();
 
-    const [createdRows] = await db.query(
-      `SELECT b.*, a.full_name AS author_name
-       FROM blog_posts b
-       LEFT JOIN admins a ON b.author_id = a.id
-       WHERE b.id = ?`,
-      [result.insertId]
-    );
+    if (error) throw error;
 
     res.status(201).json({
       success: true,
       message: 'Blog post created successfully',
-      post: mapBlogPost(createdRows[0]),
+      post: mapBlogPost(newPost),
     });
   } catch (error) {
     console.error('Create blog post error:', error);
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error.code === '23505') { // PostgreSQL unique constraint error code
       return res.status(409).json({
         success: false,
         message: 'Slug already exists. Please choose a different slug.',
@@ -227,46 +218,37 @@ router.put('/:id', authMiddleware, blogValidators, async (req, res) => {
     const postId = req.params.id;
     const { title, slug, excerpt, content, cover_image, published_date, is_published } = req.body;
 
-    const [existing] = await db.query('SELECT id FROM blog_posts WHERE id = ?', [postId]);
-    if (existing.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Blog post not found',
-      });
-    }
-
-    await db.query(
-      `UPDATE blog_posts
-       SET title = ?, slug = ?, excerpt = ?, content = ?, cover_image = ?, published_date = ?, is_published = ?
-       WHERE id = ?`,
-      [
+    const { data: updatedPost, error } = await supabase
+      .from('blog_posts')
+      .update({
         title,
         slug,
         excerpt,
         content,
-        cover_image || null,
+        cover_image: cover_image || null,
         published_date,
-        parseBoolean(is_published, true) ? 1 : 0,
-        postId,
-      ]
-    );
+        is_published: parseBoolean(is_published, true),
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', postId)
+      .select('*, author:admins(full_name)')
+      .single();
 
-    const [updatedRows] = await db.query(
-      `SELECT b.*, a.full_name AS author_name
-       FROM blog_posts b
-       LEFT JOIN admins a ON b.author_id = a.id
-       WHERE b.id = ?`,
-      [postId]
-    );
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ success: false, message: 'Blog post not found' });
+      }
+      throw error;
+    }
 
     res.json({
       success: true,
       message: 'Blog post updated successfully',
-      post: mapBlogPost(updatedRows[0]),
+      post: mapBlogPost(updatedPost),
     });
   } catch (error) {
     console.error('Update blog post error:', error);
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error.code === '23505') {
       return res.status(409).json({
         success: false,
         message: 'Slug already exists. Please choose a different slug.',
@@ -282,16 +264,18 @@ router.put('/:id', authMiddleware, blogValidators, async (req, res) => {
 // Admin: delete blog post
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
-    const postId = req.params.id;
-    const [existing] = await db.query('SELECT id FROM blog_posts WHERE id = ?', [postId]);
-    if (existing.length === 0) {
+    const { error, count } = await supabase
+      .from('blog_posts')
+      .delete({ count: 'exact' })
+      .eq('id', req.params.id);
+
+    if (error) throw error;
+    if (count === 0) {
       return res.status(404).json({
         success: false,
         message: 'Blog post not found',
       });
     }
-
-    await db.query('DELETE FROM blog_posts WHERE id = ?', [postId]);
 
     res.json({
       success: true,

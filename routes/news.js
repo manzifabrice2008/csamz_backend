@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken: authMiddleware } = require('../middleware/auth');
 
 const parseImageUrls = (rawValue) => {
@@ -17,7 +17,6 @@ const parseImageUrls = (rawValue) => {
         return parsed.filter((url) => typeof url === 'string' && url.trim() !== '');
       }
     } catch (error) {
-      // In older records image_url may store just a single string; fall back gracefully
       if (rawValue.trim().length > 0) {
         return [rawValue.trim()];
       }
@@ -28,6 +27,10 @@ const parseImageUrls = (rawValue) => {
 };
 
 const formatArticle = (article) => {
+  // Supabase join returns author as an object
+  const author_username = article.author?.username || null;
+  const author_name = article.author?.full_name || null;
+
   const parsedImageUrls = parseImageUrls(article.image_urls);
   const normalizedImageUrls = parsedImageUrls.length
     ? parsedImageUrls
@@ -37,23 +40,24 @@ const formatArticle = (article) => {
 
   return {
     ...article,
+    author_username,
+    author_name,
     image_url: primaryImage,
-    image_urls: normalizedImageUrls
+    image_urls: normalizedImageUrls,
+    author: undefined // Clean up join object
   };
 };
 
 // Get all news articles (public)
 router.get('/', async (req, res) => {
   try {
-    const [articles] = await db.query(`
-      SELECT 
-        n.*,
-        a.username as author_username,
-        a.full_name as author_name
-      FROM news_articles n
-      LEFT JOIN admins a ON n.author_id = a.id
-      ORDER BY n.published_date DESC, n.created_at DESC
-    `);
+    const { data: articles, error } = await supabase
+      .from('news_articles')
+      .select('*, author:admins(username, full_name)')
+      .order('published_date', { ascending: false })
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
 
     const formattedArticles = articles.map(formatArticle);
 
@@ -74,26 +78,25 @@ router.get('/', async (req, res) => {
 // Get single article by ID (public)
 router.get('/:id', async (req, res) => {
   try {
-    const [articles] = await db.query(`
-      SELECT 
-        n.*,
-        a.username as author_username,
-        a.full_name as author_name
-      FROM news_articles n
-      LEFT JOIN admins a ON n.author_id = a.id
-      WHERE n.id = ?
-    `, [req.params.id]);
+    const { data: articles, error } = await supabase
+      .from('news_articles')
+      .select('*, author:admins(username, full_name)')
+      .eq('id', req.params.id)
+      .single();
 
-    if (articles.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Article not found'
-      });
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({
+          success: false,
+          message: 'Article not found'
+        });
+      }
+      throw error;
     }
 
     res.json({
       success: true,
-      article: formatArticle(articles[0])
+      article: formatArticle(articles)
     });
   } catch (error) {
     console.error('Get article error:', error);
@@ -119,7 +122,6 @@ router.post('/',
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        console.error('Validation errors:', errors.array());
         return res.status(400).json({
           success: false,
           message: 'Validation failed',
@@ -129,33 +131,36 @@ router.post('/',
 
       const { title, excerpt, content, category, image_urls, published_date } = req.body;
       const author_id = req.user.id;
-
-      // Use current date if published_date is not provided
       const finalPublishedDate = published_date || new Date().toISOString().split('T')[0];
 
       const imageArray = Array.isArray(image_urls)
         ? image_urls.filter((url) => typeof url === 'string' && url.trim() !== '')
         : [];
       const primaryImage = imageArray[0] || '';
-      const imagesJson = JSON.stringify(imageArray);
 
-      const [result] = await db.query(
-        'INSERT INTO news_articles (title, excerpt, content, category, image_url, image_urls, author_id, published_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [title, excerpt, content || '', category, primaryImage, imagesJson, author_id, finalPublishedDate]
-      );
+      const { data, error } = await supabase
+        .from('news_articles')
+        .insert([{
+          title,
+          excerpt,
+          content: content || '',
+          category,
+          image_url: primaryImage,
+          image_urls: JSON.stringify(imageArray),
+          author_id,
+          published_date: finalPublishedDate
+        }])
+        .select()
+        .single();
+
+      if (error) throw error;
 
       res.status(201).json({
         success: true,
         message: 'Article created successfully',
         article: {
-          id: result.insertId,
-          title,
-          excerpt,
-          content,
-          category,
-          image_url: primaryImage,
-          image_urls: imageArray,
-          published_date: finalPublishedDate
+          ...data,
+          image_urls: imageArray
         }
       });
     } catch (error) {
@@ -193,66 +198,40 @@ router.put('/:id',
       const { title, excerpt, content, category, image_urls, published_date } = req.body;
       const articleId = req.params.id;
 
-      // Check if article exists
-      const [existingArticle] = await db.query('SELECT * FROM news_articles WHERE id = ?', [articleId]);
-
-      if (existingArticle.length === 0) {
-        return res.status(404).json({
-          success: false,
-          message: 'Article not found'
-        });
-      }
-
-      // Build update query dynamically
-      const updates = [];
-      const values = [];
-
-      if (title) {
-        updates.push('title = ?');
-        values.push(title);
-      }
-      if (excerpt) {
-        updates.push('excerpt = ?');
-        values.push(excerpt);
-      }
-      if (content !== undefined) {
-        updates.push('content = ?');
-        values.push(content);
-      }
-      if (category) {
-        updates.push('category = ?');
-        values.push(category);
-      }
+      const updateData = {};
+      if (title) updateData.title = title;
+      if (excerpt) updateData.excerpt = excerpt;
+      if (content !== undefined) updateData.content = content;
+      if (category) updateData.category = category;
       if (image_urls !== undefined) {
         const imageArray = Array.isArray(image_urls)
           ? image_urls.filter((url) => typeof url === 'string' && url.trim() !== '')
           : [];
-        const primaryImage = imageArray[0] || '';
-
-        updates.push('image_url = ?');
-        values.push(primaryImage);
-
-        updates.push('image_urls = ?');
-        values.push(JSON.stringify(imageArray));
+        updateData.image_url = imageArray[0] || '';
+        updateData.image_urls = JSON.stringify(imageArray);
       }
-      if (published_date) {
-        updates.push('published_date = ?');
-        values.push(published_date);
-      }
+      if (published_date) updateData.published_date = published_date;
 
-      if (updates.length === 0) {
+      if (Object.keys(updateData).length === 0) {
         return res.status(400).json({
           success: false,
           message: 'No fields to update'
         });
       }
 
-      values.push(articleId);
+      const { data, error } = await supabase
+        .from('news_articles')
+        .update(updateData)
+        .eq('id', articleId)
+        .select();
 
-      await db.query(
-        `UPDATE news_articles SET ${updates.join(', ')} WHERE id = ?`,
-        values
-      );
+      if (error) throw error;
+      if (data.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'Article not found'
+        });
+      }
 
       res.json({
         success: true,
@@ -271,11 +250,13 @@ router.put('/:id',
 // Delete article (protected)
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
-    const articleId = req.params.id;
+    const { error, count } = await supabase
+      .from('news_articles')
+      .delete({ count: 'exact' })
+      .eq('id', req.params.id);
 
-    const [result] = await db.query('DELETE FROM news_articles WHERE id = ?', [articleId]);
-
-    if (result.affectedRows === 0) {
+    if (error) throw error;
+    if (count === 0) {
       return res.status(404).json({
         success: false,
         message: 'Article not found'

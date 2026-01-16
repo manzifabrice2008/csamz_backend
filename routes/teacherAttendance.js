@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { body, validationResult } = require('express-validator');
 
@@ -15,7 +15,7 @@ const ensureTeacher = (req, res, next) => {
 router.post('/', authenticateToken, ensureTeacher, [
     body('date').isISO8601().toDate().withMessage('Valid date is required'),
     body('attendance').isArray().withMessage('Attendance data must be an array'),
-    body('attendance.*.student_id').isInt().withMessage('Student ID is required'),
+    body('attendance.*.student_id').notEmpty().withMessage('Student ID is required'),
     body('attendance.*.status').isIn(['present', 'absent', 'late', 'excused']),
     body('attendance.*.remarks').optional().isString()
 ], async (req, res) => {
@@ -28,34 +28,23 @@ router.post('/', authenticateToken, ensureTeacher, [
         const teacherId = req.user.id;
         const { date, attendance } = req.body;
 
-        // Format date for MySQL
-        const dateObj = new Date(date);
-        const formattedDate = dateObj.toISOString().slice(0, 19).replace('T', ' ');
+        const dateStr = date.toISOString().slice(0, 10); // Use YYYY-MM-DD for attendance uniqueness usually
 
-        const connection = await db.getConnection();
+        const upsertPayload = attendance.map(record => ({
+            student_id: record.student_id,
+            date: dateStr,
+            status: record.status,
+            remarks: record.remarks || null,
+            recorded_by: teacherId
+        }));
 
-        try {
-            await connection.beginTransaction();
+        const { error } = await supabase
+            .from('attendance')
+            .upsert(upsertPayload, { onConflict: 'student_id,date' });
 
-            for (const record of attendance) {
-                // Upsert attendance record
-                await connection.query(
-                    `INSERT INTO attendance (student_id, date, status, remarks, recorded_by)
-                     VALUES (?, ?, ?, ?, ?)
-                     ON DUPLICATE KEY UPDATE status = VALUES(status), remarks = VALUES(remarks), recorded_by = VALUES(recorded_by)`,
-                    [record.student_id, formattedDate, record.status, record.remarks || null, teacherId]
-                );
-            }
+        if (error) throw error;
 
-            await connection.commit();
-            res.json({ success: true, message: 'Attendance recorded successfully' });
-
-        } catch (err) {
-            await connection.rollback();
-            throw err;
-        } finally {
-            connection.release();
-        }
+        res.json({ success: true, message: 'Attendance recorded successfully' });
 
     } catch (error) {
         console.error('Mark attendance error:', error);
@@ -63,42 +52,44 @@ router.post('/', authenticateToken, ensureTeacher, [
     }
 });
 
-// GET /history - Get attendance history for teacher's view (e.g. for a specific date or student)
+// GET /history - Get attendance history for teacher's view
 router.get('/history', authenticateToken, ensureTeacher, async (req, res) => {
     try {
         const { date, student_id } = req.query;
-        let query = `SELECT a.*, s.full_name, s.trade 
-                     FROM attendance a
-                     JOIN students s ON s.id = a.student_id`;
-        const params = [];
-        const conditions = [];
 
         // Filter by teacher's trade (security so they don't see others)
-        const [teacherRows] = await db.query('SELECT trade FROM teachers WHERE id = ?', [req.user.id]);
-        const trade = teacherRows[0].trade;
+        const { data: teacher, error: tError } = await supabase
+            .from('teachers')
+            .select('trade')
+            .eq('id', req.user.id)
+            .single();
 
-        conditions.push('s.trade = ?');
-        params.push(trade);
+        if (tError) throw tError;
+
+        let query = supabase
+            .from('attendance')
+            .select('*, student:students!inner(full_name, trade)')
+            .eq('student.trade', teacher.trade);
 
         if (date) {
-            conditions.push('DATE(a.date) = ?');
-            params.push(date);
+            query = query.eq('date', date);
         }
 
         if (student_id) {
-            conditions.push('a.student_id = ?');
-            params.push(student_id);
+            query = query.eq('student_id', student_id);
         }
 
-        if (conditions.length > 0) {
-            query += ' WHERE ' + conditions.join(' AND ');
-        }
+        const { data: rows, error } = await query.order('date', { ascending: false });
 
-        query += ' ORDER BY a.date DESC';
+        if (error) throw error;
 
-        const [rows] = await db.query(query, params);
+        const formattedRows = rows.map(row => ({
+            ...row,
+            full_name: row.student?.full_name,
+            trade: row.student?.trade
+        }));
 
-        res.json({ success: true, attendance: rows });
+        res.json({ success: true, attendance: formattedRows });
 
     } catch (error) {
         console.error('Get attendance history error:', error);

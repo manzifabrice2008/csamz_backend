@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
 // Get notifications
@@ -10,34 +10,34 @@ router.get('/', authenticateToken, async (req, res) => {
             return res.status(403).json({ success: false, message: 'Access denied' });
         }
 
-        // Determine user type from auth logic or assume based on role if needed
-        // The current auth middleware puts role in req.user
         const userType = req.user.role; // 'student', 'teacher', 'admin'
-
-        // Note: The schema has user_type column. 
-        // If your roles map exactly, great. If 'super_admin' maps to 'admin' in notifications, adjust here.
         let dbUserType = userType;
         if (userType === 'super_admin') dbUserType = 'admin';
 
-        const [notifications] = await db.query(
-            `SELECT * FROM notifications 
-       WHERE user_id = ? AND user_type = ? 
-       ORDER BY created_at DESC 
-       LIMIT 50`,
-            [req.user.id, dbUserType]
-        );
+        const { data: notifications, error } = await supabase
+            .from('notifications')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .eq('user_type', dbUserType)
+            .order('created_at', { ascending: false })
+            .limit(50);
 
-        // Also get unread count
-        const [countRows] = await db.query(
-            `SELECT COUNT(*) as unread_count FROM notifications 
-         WHERE user_id = ? AND user_type = ? AND is_read = 0`,
-            [req.user.id, dbUserType]
-        );
+        if (error) throw error;
+
+        // Get unread count
+        const { count, error: countError } = await supabase
+            .from('notifications')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', req.user.id)
+            .eq('user_type', dbUserType)
+            .eq('is_read', false);
+
+        if (countError) throw countError;
 
         res.json({
             success: true,
             notifications,
-            unreadCount: countRows[0].unread_count
+            unreadCount: count || 0
         });
     } catch (error) {
         console.error('Get notifications error:', error);
@@ -50,10 +50,13 @@ router.put('/:id/read', authenticateToken, async (req, res) => {
     try {
         const notificationId = req.params.id;
 
-        await db.query(
-            'UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?',
-            [notificationId, req.user.id]
-        );
+        const { error } = await supabase
+            .from('notifications')
+            .update({ is_read: true })
+            .eq('id', notificationId)
+            .eq('user_id', req.user.id);
+
+        if (error) throw error;
 
         res.json({ success: true });
     } catch (error) {
@@ -67,10 +70,13 @@ router.put('/read-all', authenticateToken, async (req, res) => {
     try {
         const userType = req.user.role === 'super_admin' ? 'admin' : req.user.role;
 
-        await db.query(
-            'UPDATE notifications SET is_read = 1 WHERE user_id = ? AND user_type = ?',
-            [req.user.id, userType]
-        );
+        const { error } = await supabase
+            .from('notifications')
+            .update({ is_read: true })
+            .eq('user_id', req.user.id)
+            .eq('user_type', userType);
+
+        if (error) throw error;
 
         res.json({ success: true });
     } catch (error) {

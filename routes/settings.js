@@ -1,9 +1,9 @@
 const express = require('express');
-const router = express.Router();
+const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const emailService = require('../services/email');
 
@@ -19,77 +19,94 @@ const validate = (req, res, next) => {
 };
 
 const ensureNotificationSettings = async (adminId) => {
-  const [existing] = await db.query(
-    'SELECT * FROM admin_notification_settings WHERE admin_id = ?',
-    [adminId]
-  );
+  const { data: existing, error: fetchError } = await supabase
+    .from('admin_notification_settings')
+    .select('*')
+    .eq('admin_id', adminId)
+    .single();
 
-  if (existing.length === 0) {
-    await db.query(
-      'INSERT INTO admin_notification_settings (admin_id) VALUES (?)',
-      [adminId]
-    );
+  if (fetchError && fetchError.code === 'PGRST116') {
+    const { data: inserted, error: insertError } = await supabase
+      .from('admin_notification_settings')
+      .insert([{ admin_id: adminId }])
+      .select()
+      .single();
 
-    return {
-      email_notifications: 1,
-      sms_notifications: 0,
-      in_app_notifications: 1
-    };
+    if (insertError) throw insertError;
+    return inserted;
   }
 
-  return existing[0];
+  if (fetchError) throw fetchError;
+  return existing;
 };
 
 const getSiteSettings = async () => {
-  const [rows] = await db.query('SELECT * FROM site_settings LIMIT 1');
-  if (rows.length === 0) {
-    await db.query(
-      'INSERT INTO site_settings (site_name, site_tagline, contact_email, contact_phone, contact_address) VALUES (?, ?, ?, ?, ?)',
-      ['CSAM Zaccaria TVET', 'Excellence in Technical Education', 'info@csam.edu', '+250 000 000 000', 'Gicumbi, Rwanda']
-    );
-    return (await db.query('SELECT * FROM site_settings LIMIT 1'))[0][0];
+  const { data, error } = await supabase
+    .from('site_settings')
+    .select('*')
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  if (!data) {
+    const { data: inserted, error: insertError } = await supabase
+      .from('site_settings')
+      .insert([{
+        site_name: 'CSAM Zaccaria TVET',
+        site_tagline: 'Excellence in Technical Education',
+        contact_email: 'info@csam.edu',
+        contact_phone: '+250 000 000 000',
+        contact_address: 'Gicumbi, Rwanda'
+      }])
+      .select()
+      .single();
+
+    if (insertError) throw insertError;
+    return inserted;
   }
-  return rows[0];
+  return data;
 };
 
 const getSMSSettings = async () => {
-  const [rows] = await db.query('SELECT * FROM sms_settings LIMIT 1');
-  if (rows.length === 0) {
-    await db.query('INSERT INTO sms_settings (provider, enabled) VALUES (?, ?)', ['console', 0]);
-    return (await db.query('SELECT * FROM sms_settings LIMIT 1'))[0][0];
+  const { data, error } = await supabase
+    .from('sms_settings')
+    .select('*')
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  if (!data) {
+    const { data: inserted, error: insertError } = await supabase
+      .from('sms_settings')
+      .insert([{ provider: 'console', enabled: false }])
+      .select()
+      .single();
+
+    if (insertError) throw insertError;
+    return inserted;
   }
-  return rows[0];
-};
-
-const createPasswordResetToken = async (adminId) => {
-  const token = crypto.randomBytes(32).toString('hex');
-  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-  const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-
-  await db.query('DELETE FROM admin_password_resets WHERE admin_id = ?', [adminId]);
-  await db.query(
-    `INSERT INTO admin_password_resets (admin_id, token_hash, expires_at)
-     VALUES (?, ?, ?)`
-    ,
-    [adminId, tokenHash, expiresAt]
-  );
-
-  return token;
+  return data;
 };
 
 // Profile routes
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
-    const [admins] = await db.query(
-      'SELECT id, username, email, full_name, role, created_at, updated_at FROM admins WHERE id = ?',
-      [req.user.id]
-    );
+    const { data: admin, error } = await supabase
+      .from('admins')
+      .select('id, username, email, full_name, role, created_at, updated_at')
+      .eq('id', req.user.id)
+      .single();
 
-    if (admins.length === 0) {
-      return res.status(404).json({ success: false, message: 'Admin not found' });
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ success: false, message: 'Admin not found' });
+      }
+      throw error;
     }
 
-    res.json({ success: true, profile: admins[0] });
+    res.json({ success: true, profile: admin });
   } catch (error) {
     console.error('Get profile error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching profile' });
@@ -110,22 +127,27 @@ router.put(
       const { username, email, full_name } = req.body;
       const adminId = req.user.id;
 
-      const [conflicts] = await db.query(
-        'SELECT id FROM admins WHERE (username = ? OR email = ?) AND id != ?',
-        [username, email, adminId]
-      );
+      const { data: conflicts, error: fetchError } = await supabase
+        .from('admins')
+        .select('id')
+        .or(`username.eq.${username},email.eq.${email}`)
+        .neq('id', adminId);
 
-      if (conflicts.length > 0) {
+      if (fetchError) throw fetchError;
+
+      if (conflicts && conflicts.length > 0) {
         return res.status(400).json({
           success: false,
           message: 'Username or email already in use by another admin'
         });
       }
 
-      await db.query(
-        'UPDATE admins SET username = ?, email = ?, full_name = ? WHERE id = ?',
-        [username, email, full_name, adminId]
-      );
+      const { error: updateError } = await supabase
+        .from('admins')
+        .update({ username, email, full_name, updated_at: new Date().toISOString() })
+        .eq('id', adminId);
+
+      if (updateError) throw updateError;
 
       res.json({
         success: true,
@@ -152,15 +174,15 @@ router.put(
       const { current_password, new_password } = req.body;
       const adminId = req.user.id;
 
-      const [admins] = await db.query('SELECT password FROM admins WHERE id = ?', [adminId]);
+      const { data: admin, error: fetchError } = await supabase
+        .from('admins')
+        .select('password')
+        .eq('id', adminId)
+        .single();
 
-      if (admins.length === 0) {
-        return res.status(404).json({ success: false, message: 'Admin not found' });
-      }
+      if (fetchError) throw fetchError;
 
-      const admin = admins[0];
       const passwordMatch = await bcrypt.compare(current_password, admin.password);
-
       if (!passwordMatch) {
         return res.status(400).json({ success: false, message: 'Current password is incorrect' });
       }
@@ -168,7 +190,12 @@ router.put(
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(new_password, salt);
 
-      await db.query('UPDATE admins SET password = ? WHERE id = ?', [hashedPassword, adminId]);
+      const { error: updateError } = await supabase
+        .from('admins')
+        .update({ password: hashedPassword, updated_at: new Date().toISOString() })
+        .eq('id', adminId);
+
+      if (updateError) throw updateError;
 
       res.json({ success: true, message: 'Password updated successfully' });
     } catch (error) {
@@ -208,16 +235,19 @@ router.put(
   validate,
   async (req, res) => {
     try {
-      await ensureNotificationSettings(req.user.id);
-
       const { email_notifications, sms_notifications, in_app_notifications } = req.body;
 
-      await db.query(
-        `UPDATE admin_notification_settings
-         SET email_notifications = ?, sms_notifications = ?, in_app_notifications = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE admin_id = ?`,
-        [email_notifications ? 1 : 0, sms_notifications ? 1 : 0, in_app_notifications ? 1 : 0, req.user.id]
-      );
+      const { error } = await supabase
+        .from('admin_notification_settings')
+        .update({
+          email_notifications: email_notifications ? 1 : 0,
+          sms_notifications: sms_notifications ? 1 : 0,
+          in_app_notifications: in_app_notifications ? 1 : 0,
+          updated_at: new Date().toISOString()
+        })
+        .eq('admin_id', req.user.id);
+
+      if (error) throw error;
 
       res.json({
         success: true,
@@ -275,36 +305,27 @@ router.put(
         instagram_url
       } = req.body;
 
-      await db.query(
-        `UPDATE site_settings
-         SET site_name = ?,
-             site_tagline = ?,
-             contact_email = ?,
-             contact_phone = ?,
-             contact_address = ?,
-             facebook_url = ?,
-             twitter_url = ?,
-             instagram_url = ?,
-             updated_by = ?,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`,
-        [
+      const { data: updated, error } = await supabase
+        .from('site_settings')
+        .update({
           site_name,
-          site_tagline || null,
-          contact_email || null,
-          contact_phone || null,
-          contact_address || null,
-          facebook_url || null,
-          twitter_url || null,
-          instagram_url || null,
-          req.user.id,
-          settings.id
-        ]
-      );
+          site_tagline: site_tagline || null,
+          contact_email: contact_email || null,
+          contact_phone: contact_phone || null,
+          contact_address: contact_address || null,
+          facebook_url: facebook_url || null,
+          twitter_url: twitter_url || null,
+          instagram_url: instagram_url || null,
+          updated_by: req.user.id,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', settings.id)
+        .select()
+        .single();
 
-      const [updated] = await db.query('SELECT * FROM site_settings WHERE id = ?', [settings.id]);
+      if (error) throw error;
 
-      res.json({ success: true, message: 'Site settings updated successfully', settings: updated[0] });
+      res.json({ success: true, message: 'Site settings updated successfully', settings: updated });
     } catch (error) {
       console.error('Update site settings error:', error);
       res.status(500).json({ success: false, message: 'Server error updating site settings' });
@@ -322,7 +343,7 @@ router.get('/sms', authenticateToken, async (req, res) => {
       settings: {
         ...settings,
         enabled: Boolean(settings.enabled),
-        additional_config: settings.additional_config ? JSON.parse(settings.additional_config) : {}
+        additional_config: settings.additional_config ? (typeof settings.additional_config === 'string' ? JSON.parse(settings.additional_config) : settings.additional_config) : {}
       }
     });
   } catch (error) {
@@ -366,39 +387,31 @@ router.put(
         }
       }
 
-      await db.query(
-        `UPDATE sms_settings
-         SET provider = ?,
-             enabled = ?,
-             sender_id = ?,
-             username = ?,
-             api_key = ?,
-             additional_config = ?,
-             updated_by = ?,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`,
-        [
+      const { data: updated, error } = await supabase
+        .from('sms_settings')
+        .update({
           provider,
-          enabled ? 1 : 0,
-          sender_id || null,
-          username || null,
-          api_key || null,
-          configToStore || null,
-          req.user.id,
-          settings.id
-        ]
-      );
+          enabled: enabled ? 1 : 0,
+          sender_id: sender_id || null,
+          username: username || null,
+          api_key: api_key || null,
+          additional_config: configToStore || null,
+          updated_by: req.user.id,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', settings.id)
+        .select()
+        .single();
 
-      const [updated] = await db.query('SELECT * FROM sms_settings WHERE id = ?', [settings.id]);
-      const updatedSettings = updated[0];
+      if (error) throw error;
 
       res.json({
         success: true,
         message: 'SMS settings updated successfully',
         settings: {
-          ...updatedSettings,
-          enabled: Boolean(updatedSettings.enabled),
-          additional_config: updatedSettings.additional_config ? JSON.parse(updatedSettings.additional_config) : {}
+          ...updated,
+          enabled: Boolean(updated.enabled),
+          additional_config: updated.additional_config ? (typeof updated.additional_config === 'string' ? JSON.parse(updated.additional_config) : updated.additional_config) : {}
         }
       });
     } catch (error) {

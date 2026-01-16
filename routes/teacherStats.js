@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
 // Helper to ensure user is a teacher
@@ -16,52 +16,59 @@ router.get('/stats', authenticateToken, ensureTeacher, async (req, res) => {
         const teacherId = req.user.id;
 
         // Get teacher's trade to filter relevant students
-        const [teacherRows] = await db.query('SELECT trade FROM teachers WHERE id = ?', [teacherId]);
-        if (teacherRows.length === 0) {
-            return res.status(404).json({ success: false, message: 'Teacher not found' });
+        const { data: teacher, error: teacherError } = await supabase
+            .from('teachers')
+            .select('trade')
+            .eq('id', teacherId)
+            .single();
+
+        if (teacherError) {
+            if (teacherError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Teacher not found' });
+            throw teacherError;
         }
-        const trade = teacherRows[0].trade;
+
+        const trade = teacher.trade;
 
         // 1. Total Students (in same trade)
-        const [studentRows] = await db.query(
-            'SELECT COUNT(*) as count FROM students WHERE trade = ?',
-            [trade]
-        );
-        const totalStudents = studentRows[0].count;
+        const { count: totalStudents, error: sError } = await supabase
+            .from('students')
+            .select('*', { count: 'exact', head: true })
+            .eq('trade', trade);
 
-        // 2. Active Assignments (created by this teacher)
-        // Assuming active means deadline is in the future or recently passed? 
-        // For now, let's just count all assignments created by this teacher
-        const [assignmentRows] = await db.query(
-            'SELECT COUNT(*) as count FROM assignments WHERE teacher_id = ?',
-            [teacherId]
-        );
-        const totalAssignments = assignmentRows[0].count;
+        if (sError) throw sError;
+
+        // 2. Total Assignments (created by this teacher)
+        const { count: totalAssignments, error: aError } = await supabase
+            .from('assignments')
+            .select('*', { count: 'exact', head: true })
+            .eq('teacher_id', teacherId);
+
+        if (aError) throw aError;
 
         // 3. Pending Grading (submissions for teacher's assignments that are not graded)
-        const [submissionRows] = await db.query(
-            `SELECT COUNT(*) as count 
-       FROM student_assignment_submissions sas
-       JOIN assignments a ON sas.assignment_id = a.id
-       WHERE a.teacher_id = ? AND sas.grade IS NULL`,
-            [teacherId]
-        );
-        const pendingGrading = submissionRows[0].count;
+        const { count: pendingGrading, error: subError } = await supabase
+            .from('student_assignment_submissions')
+            .select('*, assignment:assignments!inner(teacher_id)', { count: 'exact', head: true })
+            .eq('assignment.teacher_id', teacherId)
+            .is('grade', null);
 
-        // 4. Upcoming Exams (created by teacher)
-        const [examRows] = await db.query(
-            'SELECT COUNT(*) as count FROM exams WHERE teacher_id = ?',
-            [teacherId]
-        );
-        const totalExams = examRows[0].count;
+        if (subError) throw subError;
+
+        // 4. Total Exams (created by teacher)
+        const { count: totalExams, error: eError } = await supabase
+            .from('exams')
+            .select('*', { count: 'exact', head: true })
+            .eq('teacher_id', teacherId);
+
+        if (eError) throw eError;
 
         res.json({
             success: true,
             stats: {
-                totalStudents,
-                totalAssignments,
-                pendingGrading,
-                totalExams,
+                totalStudents: totalStudents || 0,
+                totalAssignments: totalAssignments || 0,
+                pendingGrading: pendingGrading || 0,
+                totalExams: totalExams || 0,
                 trade // beneficial for frontend to know which trade data is being shown
             }
         });

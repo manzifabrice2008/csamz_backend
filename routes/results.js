@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
 const STAFF_ROLES = new Set(['admin', 'super_admin']);
@@ -33,23 +33,32 @@ router.get('/history', authenticateToken, async (req, res) => {
 
     const studentId = req.user.id;
 
-    const [results] = await db.query(
-      `SELECT r.id, r.exam_id, r.score, r.submitted_at, e.title, e.total_marks
-       FROM results r
-       JOIN exams e ON r.exam_id = e.id
-       WHERE r.student_id = ?
-       ORDER BY r.submitted_at DESC`,
-      [studentId]
-    );
+    const { data: results, error } = await supabase
+      .from('results')
+      .select(`
+        id,
+        exam_id,
+        score,
+        submitted_at,
+        exam:exams (
+          title,
+          total_marks
+        )
+      `)
+      .eq('student_id', studentId)
+      .order('submitted_at', { ascending: false });
+
+    if (error) throw error;
 
     const formattedResults = results.map(row => {
-      const percentage = row.total_marks > 0 ? (row.score / row.total_marks) * 100 : 0;
+      const total_marks = row.exam?.total_marks || 0;
+      const percentage = total_marks > 0 ? (row.score / total_marks) * 100 : 0;
       return {
         id: row.id,
         examId: row.exam_id,
-        examTitle: row.title,
+        examTitle: row.exam?.title || 'Unknown Exam',
         score: row.score,
-        totalMarks: row.total_marks,
+        totalMarks: total_marks,
         percentage: Math.round(percentage),
         grade: getGrade(percentage),
         submittedAt: row.submitted_at
@@ -65,67 +74,77 @@ router.get('/history', authenticateToken, async (req, res) => {
 
 router.get('/:studentId/:examId', authenticateToken, async (req, res) => {
   try {
-    const studentId = Number(req.params.studentId);
-    const examId = Number(req.params.examId);
-
-    if (Number.isNaN(studentId) || Number.isNaN(examId)) {
-      return res.status(400).json({ success: false, message: 'Invalid identifiers supplied' });
-    }
+    const studentId = req.params.studentId;
+    const examId = req.params.examId;
 
     if (!req.user) {
       return res.status(401).json({ success: false, message: 'Authentication required' });
     }
 
-    const isStudentViewer = req.user.role === 'student' && req.user.id === studentId;
+    const isStudentViewer = req.user.role === 'student' && String(req.user.id) === String(studentId);
     const isStaffViewer = STAFF_ROLES.has(req.user.role) || req.user.role === 'teacher';
 
     if (!isStudentViewer && !isStaffViewer) {
       return res.status(403).json({ success: false, message: 'Access denied for this result' });
     }
 
-    const [[exam]] = await db.query('SELECT * FROM exams WHERE id = ? LIMIT 1', [examId]);
-    if (!exam) {
-      return res.status(404).json({ success: false, message: 'Exam not found' });
+    const { data: exam, error: examError } = await supabase
+      .from('exams')
+      .select('*')
+      .eq('id', examId)
+      .single();
+
+    if (examError) {
+      if (examError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Exam not found' });
+      throw examError;
     }
 
-    const [resultRows] = await db.query(
-      'SELECT score, submitted_at FROM results WHERE student_id = ? AND exam_id = ? LIMIT 1',
-      [studentId, examId]
-    );
+    const { data: result, error: resultError } = await supabase
+      .from('results')
+      .select('score, submitted_at')
+      .eq('student_id', studentId)
+      .eq('exam_id', examId)
+      .maybeSingle();
 
-    if (resultRows.length === 0) {
+    if (resultError) throw resultError;
+    if (!result) {
       return res.status(404).json({ success: false, message: 'Result not found for this student' });
     }
 
-    const result = resultRows[0];
+    const { data: answers, error: answersError } = await supabase
+      .from('questions')
+      .select(`
+        id,
+        question_text,
+        type,
+        options,
+        correct_answer,
+        marks,
+        student_answers!left (
+          answer,
+          is_correct
+        )
+      `)
+      .eq('exam_id', examId)
+      .eq('student_answers.student_id', studentId)
+      .order('id');
 
-    const [answers] = await db.query(
-      `SELECT q.id AS question_id,
-              q.question_text,
-              q.type,
-              q.options,
-              q.correct_answer,
-              q.marks,
-              sa.answer AS student_answer,
-              sa.is_correct
-       FROM questions q
-       LEFT JOIN student_answers sa ON sa.question_id = q.id AND sa.student_id = ?
-       WHERE q.exam_id = ?
-       ORDER BY q.id`,
-      [studentId, examId]
-    );
+    if (answersError) throw answersError;
 
-    const formattedAnswers = answers.map((row) => ({
-      questionId: row.question_id,
-      questionText: row.question_text,
-      type: row.type,
-      options: row.type === 'TF' ? ['True', 'False'] : safeParseOptions(row.options, []),
-      studentAnswer: row.student_answer,
-      correctAnswer: row.correct_answer,
-      isCorrect: Boolean(row.is_correct),
-      marks: row.marks,
-      marksAwarded: row.is_correct ? row.marks : 0,
-    }));
+    const formattedAnswers = answers.map((row) => {
+      const sa = row.student_answers?.[0] || {};
+      return {
+        questionId: row.id,
+        questionText: row.question_text,
+        type: row.type,
+        options: row.type === 'TF' ? ['True', 'False'] : safeParseOptions(row.options, []),
+        studentAnswer: sa.answer,
+        correctAnswer: row.correct_answer,
+        isCorrect: Boolean(sa.is_correct),
+        marks: row.marks,
+        marksAwarded: sa.is_correct ? row.marks : 0,
+      };
+    });
 
     const totalMarks =
       exam.total_marks && exam.total_marks > 0
@@ -148,10 +167,7 @@ router.get('/:studentId/:examId', authenticateToken, async (req, res) => {
         percentage: Math.round(totalMarks > 0 ? (result.score / totalMarks) * 100 : 0),
         grade: (() => {
           const p = totalMarks > 0 ? (result.score / totalMarks) * 100 : 0;
-          if (p > 80) return 'A';
-          if (p >= 70) return 'B';
-          if (p >= 50) return 'C';
-          return 'Fail';
+          return getGrade(p);
         })(),
         submitted_at: result.submitted_at,
       },

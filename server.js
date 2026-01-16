@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const { runMigrations } = require('./migrate');
 require('dotenv').config();
 
 const app = express();
@@ -136,7 +135,6 @@ const getPort = (port) => {
 // Start server
 const startServer = async () => {
   try {
-    await runMigrations();
     const PORT = process.env.PORT || 13642;
     const availablePort = await getPort(PORT);
 

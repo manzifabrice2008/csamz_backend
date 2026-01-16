@@ -3,7 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 require('dotenv').config();
 
@@ -32,25 +32,38 @@ router.post('/register',
 
       const { username, password, full_name, email, phone_number, trade } = req.body;
 
-      const [existing] = await db.query(
-        'SELECT id FROM students WHERE username = ? OR (email IS NOT NULL AND email = ?) LIMIT 1',
-        [username, email || null]
-      );
+      const { data: existing, error: fetchError } = await supabase
+        .from('students')
+        .select('id')
+        .or(`username.eq.${username}${email ? `,email.eq.${email}` : ''}`)
+        .maybeSingle();
 
-      if (existing.length > 0) {
+      if (fetchError) throw fetchError;
+
+      if (existing) {
         return res.status(400).json({ success: false, message: 'Username or email already in use' });
       }
 
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
 
-      const [result] = await db.query(
-        'INSERT INTO students (username, password, full_name, email, phone_number, trade) VALUES (?, ?, ?, ?, ?, ?)',
-        [username, hashedPassword, full_name, email || null, phone_number, trade]
-      );
+      const { data: result, error: insertError } = await supabase
+        .from('students')
+        .insert([{
+          username,
+          password: hashedPassword,
+          full_name,
+          email: email || null,
+          phone_number,
+          trade
+        }])
+        .select()
+        .single();
+
+      if (insertError) throw insertError;
 
       const token = jwt.sign(
-        { id: result.insertId, role: 'student', username, full_name, trade },
+        { id: result.id, role: 'student', username, full_name, trade },
         process.env.JWT_SECRET,
         { expiresIn: STUDENT_JWT_EXPIRY }
       );
@@ -60,7 +73,7 @@ router.post('/register',
         message: 'Student registered successfully',
         token,
         student: {
-          id: result.insertId,
+          id: result.id,
           username,
           full_name,
           email: email || null,
@@ -89,16 +102,17 @@ router.post('/login',
       }
 
       const { username, password } = req.body;
-      const [rows] = await db.query(
-        'SELECT id, username, password, full_name, email, status, trade FROM students WHERE username = ? LIMIT 1',
-        [username]
-      );
+      const { data: student, error: fetchError } = await supabase
+        .from('students')
+        .select('id, username, password, full_name, email, status, trade')
+        .eq('username', username)
+        .maybeSingle();
 
-      if (rows.length === 0) {
+      if (fetchError) throw fetchError;
+
+      if (!student) {
         return res.status(401).json({ success: false, message: 'Invalid credentials' });
       }
-
-      const student = rows[0];
 
       if (student.status !== 'active') {
         return res.status(403).json({ success: false, message: 'Account is inactive. Contact administrator.' });
@@ -141,16 +155,18 @@ router.get('/me', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    const [rows] = await db.query(
-      'SELECT id, username, full_name, email, status, trade FROM students WHERE id = ? LIMIT 1',
-      [req.user.id]
-    );
+    const { data: student, error } = await supabase
+      .from('students')
+      .select('id, username, full_name, email, status, trade')
+      .eq('id', req.user.id)
+      .maybeSingle();
 
-    if (rows.length === 0) {
+    if (error) throw error;
+
+    if (!student) {
       return res.status(404).json({ success: false, message: 'Student not found' });
     }
 
-    const student = rows[0];
     res.json({ success: true, student });
   } catch (error) {
     console.error('Student me error:', error);

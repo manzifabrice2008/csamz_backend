@@ -3,11 +3,11 @@ const router = express.Router();
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { body, validationResult } = require('express-validator');
 
-// Configuration for Multer (File Uploads)
+// Configuration for Multer (File Uploads) - Local storage for now as original
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         const uploadDir = 'uploads/assignments/materials';
@@ -38,16 +38,21 @@ const ensureTeacher = (req, res, next) => {
 router.get('/', authenticateToken, ensureTeacher, async (req, res) => {
     try {
         const teacherId = req.user.id;
-        const [assignments] = await db.query(
-            `SELECT a.*, 
-         (SELECT COUNT(*) FROM student_assignment_submissions s WHERE s.assignment_id = a.id) as submission_count 
-         FROM assignments a 
-         WHERE a.teacher_id = ? 
-         ORDER BY a.created_at DESC`,
-            [teacherId]
-        );
 
-        res.json({ success: true, assignments });
+        const { data: assignments, error } = await supabase
+            .from('assignments')
+            .select('*, submissions:student_assignment_submissions(id)')
+            .eq('teacher_id', teacherId)
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+
+        const formatted = assignments.map(a => ({
+            ...a,
+            submission_count: a.submissions?.length || 0
+        }));
+
+        res.json({ success: true, assignments: formatted });
     } catch (error) {
         console.error('List assignments error:', error);
         res.status(500).json({ success: false, message: 'Failed to fetch assignments' });
@@ -72,19 +77,34 @@ router.post('/', authenticateToken, ensureTeacher, upload.single('file'), [
         const filePath = req.file ? req.file.path : null;
 
         // Get teacher trade
-        const [teacherRows] = await db.query('SELECT trade FROM teachers WHERE id = ?', [teacherId]);
-        const trade = teacherRows[0].trade;
+        const { data: teacher, error: tError } = await supabase
+            .from('teachers')
+            .select('trade')
+            .eq('id', teacherId)
+            .single();
 
-        const [result] = await db.query(
-            `INSERT INTO assignments (title, description, trade, level, deadline, teacher_id, file_path)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [title, description, trade, level || 'L1', deadline, teacherId, filePath]
-        );
+        if (tError) throw tError;
+
+        const { data: result, error: insertError } = await supabase
+            .from('assignments')
+            .insert([{
+                title,
+                description,
+                trade: teacher.trade,
+                level: level || 'L1',
+                deadline,
+                teacher_id: teacherId,
+                file_path: filePath
+            }])
+            .select()
+            .single();
+
+        if (insertError) throw insertError;
 
         res.status(201).json({
             success: true,
             message: 'Assignment created successfully',
-            assignmentId: result.insertId
+            assignmentId: result.id
         });
 
     } catch (error) {
@@ -100,21 +120,34 @@ router.get('/:id/submissions', authenticateToken, ensureTeacher, async (req, res
         const teacherId = req.user.id;
 
         // Verify assignment belongs to teacher
-        const [assignRows] = await db.query('SELECT id FROM assignments WHERE id = ? AND teacher_id = ?', [assignmentId, teacherId]);
-        if (assignRows.length === 0) {
+        const { data: assign, error: vError } = await supabase
+            .from('assignments')
+            .select('id')
+            .eq('id', assignmentId)
+            .eq('teacher_id', teacherId)
+            .maybeSingle();
+
+        if (vError) throw vError;
+        if (!assign) {
             return res.status(404).json({ success: false, message: 'Assignment not found or access denied' });
         }
 
-        const [submissions] = await db.query(
-            `SELECT sas.*, s.full_name, s.email, s.level
-             FROM student_assignment_submissions sas
-             JOIN students s ON s.id = sas.student_id
-             WHERE sas.assignment_id = ?
-             ORDER BY sas.submitted_at DESC`,
-            [assignmentId]
-        );
+        const { data: submissions, error: sError } = await supabase
+            .from('student_assignment_submissions')
+            .select('*, student:students(full_name, email, level)')
+            .eq('assignment_id', assignmentId)
+            .order('submitted_at', { ascending: false });
 
-        res.json({ success: true, submissions });
+        if (sError) throw sError;
+
+        const formattedSubmissions = submissions.map(s => ({
+            ...s,
+            full_name: s.student?.full_name,
+            email: s.student?.email,
+            level: s.student?.level
+        }));
+
+        res.json({ success: true, submissions: formattedSubmissions });
 
     } catch (error) {
         console.error('Get submissions error:', error);
@@ -133,26 +166,31 @@ router.post('/submissions/:id/grade', authenticateToken, ensureTeacher, [
         const { grade, feedback } = req.body;
 
         // Verify submission belongs to an assignment created by this teacher
-        const [subRows] = await db.query(
-            `SELECT sas.id 
-             FROM student_assignment_submissions sas
-             JOIN assignments a ON a.id = sas.assignment_id
-             WHERE sas.id = ? AND a.teacher_id = ?`,
-            [submissionId, teacherId]
-        );
+        const { data: sub, error: vError } = await supabase
+            .from('student_assignment_submissions')
+            .select('id, assignment:assignments(teacher_id)')
+            .eq('id', submissionId)
+            .single();
 
-        if (subRows.length === 0) {
-            return res.status(404).json({ success: false, message: 'Submission not found or access denied' });
+        if (vError) {
+            if (vError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Submission not found' });
+            throw vError;
         }
 
-        await db.query(
-            `UPDATE student_assignment_submissions 
-             SET grade = ?, feedback = ?, graded_at = CURRENT_TIMESTAMP 
-             WHERE id = ?`,
-            [grade, feedback || null, submissionId]
-        );
+        if (sub.assignment?.teacher_id !== teacherId) {
+            return res.status(403).json({ success: false, message: 'Access denied' });
+        }
 
-        // Optionally, notify student here (future enhancement)
+        const { error: updateError } = await supabase
+            .from('student_assignment_submissions')
+            .update({
+                grade,
+                feedback: feedback || null,
+                graded_at: new Date().toISOString()
+            })
+            .eq('id', submissionId);
+
+        if (updateError) throw updateError;
 
         res.json({ success: true, message: 'Submission graded successfully' });
 

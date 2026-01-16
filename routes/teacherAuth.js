@@ -3,7 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 require('dotenv').config();
 
@@ -32,12 +32,15 @@ router.post(
 
       const { full_name, username, email, password, trade } = req.body;
 
-      const [existing] = await db.query(
-        'SELECT id FROM teachers WHERE username = ? OR email = ? LIMIT 1',
-        [username, email]
-      );
+      const { data: existing, error: fetchError } = await supabase
+        .from('teachers')
+        .select('id')
+        .or(`username.eq.${username},email.eq.${email}`)
+        .maybeSingle();
 
-      if (existing.length > 0) {
+      if (fetchError) throw fetchError;
+
+      if (existing) {
         return res.status(400).json({
           success: false,
           message: 'Username or email already in use',
@@ -47,16 +50,19 @@ router.post(
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
 
-      const [result] = await db.query(
-        'INSERT INTO teachers (full_name, username, email, password, trade, status) VALUES (?, ?, ?, ?, ?, "pending")',
-        [full_name, username, email, hashedPassword, trade]
-      );
+      const { data: result, error: insertError } = await supabase
+        .from('teachers')
+        .insert([{ full_name, username, email, password: hashedPassword, trade, status: 'pending' }])
+        .select()
+        .single();
+
+      if (insertError) throw insertError;
 
       res.status(201).json({
         success: true,
         message: 'Registration submitted. An admin must approve your account before you can log in.',
         teacher: {
-          id: result.insertId,
+          id: result.id,
           full_name,
           username,
           email,
@@ -86,16 +92,17 @@ router.post(
 
       const { email, password } = req.body;
 
-      const [rows] = await db.query(
-        'SELECT id, full_name, username, email, password, status FROM teachers WHERE email = ? LIMIT 1',
-        [email]
-      );
+      const { data: teacher, error: fetchError } = await supabase
+        .from('teachers')
+        .select('id, full_name, username, email, password, status')
+        .eq('email', email)
+        .maybeSingle();
 
-      if (rows.length === 0) {
+      if (fetchError) throw fetchError;
+
+      if (!teacher) {
         return res.status(401).json({ success: false, message: 'Invalid credentials' });
       }
-
-      const teacher = rows[0];
 
       if (teacher.status !== 'approved') {
         return res.status(403).json({
@@ -150,16 +157,19 @@ router.get('/me', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    const [rows] = await db.query(
-      'SELECT id, full_name, username, email, status, created_at FROM teachers WHERE id = ? LIMIT 1',
-      [req.user.id]
-    );
+    const { data: teacher, error } = await supabase
+      .from('teachers')
+      .select('id, full_name, username, email, status, created_at')
+      .eq('id', req.user.id)
+      .maybeSingle();
 
-    if (rows.length === 0) {
+    if (error) throw error;
+
+    if (!teacher) {
       return res.status(404).json({ success: false, message: 'Teacher not found' });
     }
 
-    res.json({ success: true, teacher: rows[0] });
+    res.json({ success: true, teacher });
   } catch (error) {
     console.error('Teacher me error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
@@ -173,11 +183,14 @@ router.get('/admin/list', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Only admins can view teachers' });
     }
 
-    const [rows] = await db.query(
-      'SELECT id, full_name, username, email, status, created_at FROM teachers ORDER BY created_at DESC'
-    );
+    const { data: teachers, error } = await supabase
+      .from('teachers')
+      .select('id, full_name, username, email, status, created_at')
+      .order('created_at', { ascending: false });
 
-    res.json({ success: true, teachers: rows });
+    if (error) throw error;
+
+    res.json({ success: true, teachers });
   } catch (error) {
     console.error('List teachers error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
@@ -199,21 +212,15 @@ router.patch(
         return res.status(400).json({ success: false, errors: errors.array() });
       }
 
-      const teacherId = Number(req.params.id);
-      if (Number.isNaN(teacherId)) {
-        return res.status(400).json({ success: false, message: 'Invalid teacher id' });
-      }
-
+      const teacherId = req.params.id;
       const { status } = req.body;
 
-      const [result] = await db.query('UPDATE teachers SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [
-        status,
-        teacherId,
-      ]);
+      const { error, count } = await supabase
+        .from('teachers')
+        .update({ status, updated_at: new Date().toISOString() })
+        .eq('id', teacherId);
 
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ success: false, message: 'Teacher not found' });
-      }
+      if (error) throw error;
 
       res.json({ success: true, message: `Teacher status updated to ${status}` });
     } catch (error) {

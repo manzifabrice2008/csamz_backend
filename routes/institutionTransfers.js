@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { uploadDocument } = require('./upload');
 
@@ -45,15 +45,24 @@ router.post('/request',
       const documentPath = `/uploads/${req.file.filename}`;
 
       // Save to database
-      const [result] = await db.query(
-        'INSERT INTO institution_transfers (student_id, current_institution, target_institution, reason, witness_document_path) VALUES (?, ?, ?, ?, ?)',
-        [req.user.id, currentInstitution, targetInstitution, reason, documentPath]
-      );
+      const { data, error } = await supabase
+        .from('institution_transfers')
+        .insert([{
+          student_id: req.user.id,
+          current_institution: currentInstitution,
+          target_institution: targetInstitution,
+          reason,
+          witness_document_path: documentPath
+        }])
+        .select()
+        .single();
+
+      if (error) throw error;
 
       res.status(201).json({
         success: true,
         message: 'Transfer request submitted successfully',
-        transferId: result.insertId
+        transferId: data.id
       });
     } catch (error) {
       console.error('Transfer request error:', error);
@@ -76,21 +85,24 @@ router.get('/', authenticateToken, async (req, res) => {
       });
     }
 
-    const [transfers] = await db.query(`
-      SELECT 
-        it.*, 
-        s.full_name as student_name, 
-        s.trade as student_trade,
-        CONCAT('/api/upload/witness-document/', SUBSTRING_INDEX(it.witness_document_path, '/', -1)) as document_url
-      FROM institution_transfers it
-      JOIN students s ON it.student_id = s.id
-      ORDER BY it.created_at DESC
-    `);
+    const { data: transfers, error } = await supabase
+      .from('institution_transfers')
+      .select('*, student:students(full_name, trade)')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const formattedTransfers = transfers.map(it => ({
+      ...it,
+      student_name: it.student?.full_name,
+      student_trade: it.student?.trade,
+      document_url: `/api/upload/witness-document/${it.witness_document_path.split('/').pop()}`
+    }));
 
     res.json({
       success: true,
-      count: transfers.length,
-      transfers
+      count: formattedTransfers.length,
+      transfers: formattedTransfers
     });
   } catch (error) {
     console.error('Get transfer requests error:', error);
@@ -130,26 +142,29 @@ router.patch('/:id/status',
       const transferId = req.params.id;
 
       // Update transfer status
-      await db.query(
-        'UPDATE institution_transfers SET status = ?, admin_notes = ?, processed_by = ?, processed_at = NOW() WHERE id = ?',
-        [status, adminNotes || null, req.user.id, transferId]
-      );
+      const { data: transfer, error: updateError } = await supabase
+        .from('institution_transfers')
+        .update({
+          status,
+          admin_notes: adminNotes || null,
+          processed_by: req.user.id,
+          processed_at: new Date().toISOString()
+        })
+        .eq('id', transferId)
+        .select()
+        .single();
+
+      if (updateError) throw updateError;
 
       // If approved, update student's institution
       if (status === 'approved') {
-        // Get the target institution from the transfer request
-        const [transfer] = await db.query(
-          'SELECT student_id, target_institution FROM institution_transfers WHERE id = ?',
-          [transferId]
-        );
+        // Update student's institution
+        const { error: studentUpdateError } = await supabase
+          .from('students')
+          .update({ institution: transfer.target_institution })
+          .eq('id', transfer.student_id);
 
-        if (transfer.length > 0) {
-          // Update student's institution (assuming we add an institution field to students table)
-          await db.query(
-            'UPDATE students SET institution = ? WHERE id = ?',
-            [transfer[0].target_institution, transfer[0].student_id]
-          );
-        }
+        if (studentUpdateError) throw studentUpdateError;
       }
 
       res.json({
@@ -176,20 +191,23 @@ router.get('/my-requests', authenticateToken, async (req, res) => {
       });
     }
 
-    const [transfers] = await db.query(
-      `SELECT 
-        it.*,
-        CONCAT('/api/upload/witness-document/', SUBSTRING_INDEX(it.witness_document_path, '/', -1)) as document_url
-      FROM institution_transfers it 
-      WHERE student_id = ? 
-      ORDER BY created_at DESC`,
-      [req.user.id]
-    );
+    const { data: transfers, error } = await supabase
+      .from('institution_transfers')
+      .select('*')
+      .eq('student_id', req.user.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const formattedTransfers = transfers.map(it => ({
+      ...it,
+      document_url: `/api/upload/witness-document/${it.witness_document_path.split('/').pop()}`
+    }));
 
     res.json({
       success: true,
-      count: transfers.length,
-      transfers
+      count: formattedTransfers.length,
+      transfers: formattedTransfers
     });
   } catch (error) {
     console.error('Get my transfer requests error:', error);

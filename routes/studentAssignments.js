@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const multer = require('multer');
 const path = require('path');
@@ -25,7 +25,6 @@ const upload = multer({
     storage: storage,
     limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
     fileFilter: (req, file, cb) => {
-        // checks allowed file types if needed
         cb(null, true);
     }
 });
@@ -37,38 +36,51 @@ router.get('/', authenticateToken, async (req, res) => {
             return res.status(403).json({ success: false, message: 'Access denied' });
         }
 
-        // Get student's trade and level to filter assignments
-        const [studentRows] = await db.query(
-            'SELECT trade, level FROM students WHERE id = ?',
-            [req.user.id]
-        );
+        const studentId = req.user.id;
 
-        if (studentRows.length === 0) {
-            return res.status(404).json({ success: false, message: 'Student not found' });
+        // Get student's trade and level to filter assignments
+        const { data: student, error: studentError } = await supabase
+            .from('students')
+            .select('trade, level')
+            .eq('id', studentId)
+            .single();
+
+        if (studentError) {
+            if (studentError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Student not found' });
+            throw studentError;
         }
 
-        const { trade, level } = studentRows[0];
+        const { trade, level } = student;
 
         // Get assignments for this trade/level, including submission status
-        const [assignments] = await db.query(
-            `SELECT 
-         a.*,
-         s.id as submission_id,
-         s.submitted_at,
-         s.grade,
-         s.feedback,
-         t.full_name as teacher_name
-       FROM assignments a
-       LEFT JOIN student_assignment_submissions s ON a.id = s.assignment_id AND s.student_id = ?
-       LEFT JOIN teachers t ON a.teacher_id = t.id
-       WHERE a.trade = ? AND a.level = ?
-       ORDER BY a.deadline ASC`,
-            [req.user.id, trade, level]
-        );
+        // Using inner join on teachers and left join on submissions
+        const { data: assignments, error: aError } = await supabase
+            .from('assignments')
+            .select('*, submissions:student_assignment_submissions!left(*), teacher:teachers(full_name)')
+            .eq('trade', trade)
+            .eq('level', level)
+            .order('deadline', { ascending: true });
+
+        if (aError) throw aError;
+
+        // Filter submissions for current student and format
+        const formatted = assignments.map(a => {
+            const studentSumission = (a.submissions || []).find(s => s.student_id === studentId);
+            return {
+                ...a,
+                submission_id: studentSumission?.id || null,
+                submitted_at: studentSumission?.submitted_at || null,
+                grade: studentSumission?.grade || null,
+                feedback: studentSumission?.feedback || null,
+                teacher_name: a.teacher?.full_name,
+                submissions: undefined,
+                teacher: undefined
+            };
+        });
 
         res.json({
             success: true,
-            assignments
+            assignments: formatted
         });
     } catch (error) {
         console.error('Get assignments error:', error);
@@ -91,33 +103,23 @@ router.post('/:id/submit', authenticateToken, upload.single('file'), async (req,
         const studentId = req.user.id;
         const filePath = `/uploads/assignments/submissions/${req.file.filename}`;
 
-        // Check if already submitted
-        const [existing] = await db.query(
-            'SELECT id FROM student_assignment_submissions WHERE assignment_id = ? AND student_id = ?',
-            [assignmentId, studentId]
-        );
+        const { data, error } = await supabase
+            .from('student_assignment_submissions')
+            .upsert({
+                assignment_id: assignmentId,
+                student_id: studentId,
+                submission_path: filePath,
+                submitted_at: new Date().toISOString()
+            }, { onConflict: 'assignment_id,student_id' })
+            .select()
+            .single();
 
-        if (existing.length > 0) {
-            // Update existing submission
-            await db.query(
-                `UPDATE student_assignment_submissions 
-                 SET submission_path = ?, submitted_at = NOW() 
-                 WHERE id = ?`,
-                [filePath, existing[0].id]
-            );
-        } else {
-            // Insert new submission
-            await db.query(
-                `INSERT INTO student_assignment_submissions (assignment_id, student_id, submission_path)
-                 VALUES (?, ?, ?)`,
-                [assignmentId, studentId, filePath]
-            );
-        }
+        if (error) throw error;
 
         res.json({
             success: true,
             message: 'Assignment submitted successfully',
-            filePath
+            filePath: data.submission_path
         });
 
     } catch (error) {
@@ -133,30 +135,38 @@ router.get('/:id', authenticateToken, async (req, res) => {
             return res.status(403).json({ success: false, message: 'Access denied' });
         }
 
-        const [rows] = await db.query(
-            `SELECT a.*, t.full_name as teacher_name 
-             FROM assignments a
-             LEFT JOIN teachers t ON a.teacher_id = t.id
-             WHERE a.id = ?`,
-            [req.params.id]
-        );
+        const assignmentId = req.params.id;
+        const studentId = req.user.id;
 
-        if (rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'Assignment not found' });
+        const { data: assignment, error: aError } = await supabase
+            .from('assignments')
+            .select('*, teacher:teachers(full_name)')
+            .eq('id', assignmentId)
+            .single();
+
+        if (aError) {
+            if (aError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Assignment not found' });
+            throw aError;
         }
 
-        const assignment = rows[0];
-
         // Check submission
-        const [submission] = await db.query(
-            'SELECT * FROM student_assignment_submissions WHERE assignment_id = ? AND student_id = ?',
-            [assignment.id, req.user.id]
-        );
+        const { data: submission, error: sError } = await supabase
+            .from('student_assignment_submissions')
+            .select('*')
+            .eq('assignment_id', assignmentId)
+            .eq('student_id', studentId)
+            .maybeSingle();
+
+        if (sError) throw sError;
 
         res.json({
             success: true,
-            assignment,
-            submission: submission[0] || null
+            assignment: {
+                ...assignment,
+                teacher_name: assignment.teacher?.full_name,
+                teacher: undefined
+            },
+            submission: submission || null
         });
 
     } catch (error) {

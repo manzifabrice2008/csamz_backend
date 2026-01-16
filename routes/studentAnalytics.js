@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
 // Get student overall statistics
@@ -13,48 +13,58 @@ router.get('/stats', authenticateToken, async (req, res) => {
         const studentId = req.user.id;
 
         // 1. Attendance Rate
-        const [attendanceRows] = await db.query(
-            `SELECT 
-         COUNT(*) as total_days,
-         SUM(CASE WHEN status IN ('present', 'late', 'excused') THEN 1 ELSE 0 END) as present_days
-       FROM attendance 
-       WHERE student_id = ?`,
-            [studentId]
-        );
+        const { data: attendanceRows, error: attError } = await supabase
+            .from('attendance')
+            .select('status')
+            .eq('student_id', studentId);
 
-        const totalDays = attendanceRows[0].total_days || 0;
-        const presentDays = attendanceRows[0].present_days || 0;
+        if (attError) throw attError;
+
+        const totalDays = attendanceRows.length;
+        const presentDays = attendanceRows.filter(r => ['present', 'late', 'excused'].includes(r.status)).length;
         const attendanceRate = totalDays > 0 ? Math.round((presentDays / totalDays) * 100) : 0;
 
         // 2. Assignment Completion
-        // Total assignments for their trade/level vs submitted
-        const [studentInfo] = await db.query(
-            'SELECT trade, level FROM students WHERE id = ?',
-            [studentId]
-        );
+        const { data: student, error: sError } = await supabase
+            .from('students')
+            .select('trade, level')
+            .eq('id', studentId)
+            .single();
+
+        if (sError) throw sError;
 
         let assignmentCompletion = 0;
-        if (studentInfo.length > 0) {
-            const { trade, level } = studentInfo[0];
-            const [assignmentStats] = await db.query(
-                `SELECT 
-           (SELECT COUNT(*) FROM assignments WHERE trade = ? AND level = ?) as total_assignments,
-           (SELECT COUNT(*) FROM student_assignment_submissions WHERE student_id = ?) as submitted_assignments`,
-                [trade, level, studentId]
-            );
+        const { trade, level } = student;
 
-            const totalAssignments = assignmentStats[0].total_assignments || 0;
-            const submittedAssignments = assignmentStats[0].submitted_assignments || 0;
-            assignmentCompletion = totalAssignments > 0 ? Math.round((submittedAssignments / totalAssignments) * 100) : 0;
-        }
+        // Total assignments for their trade/level
+        const { count: totalAssignments, error: aError } = await supabase
+            .from('assignments')
+            .select('*', { count: 'exact', head: true })
+            .eq('trade', trade)
+            .eq('level', level);
 
-        // 3. Average Grades (Exams + Assignments)
-        // For now, let's just pull from exam results as primarily implemented
-        const [gradeRows] = await db.query(
-            `SELECT AVG(score) as avg_score FROM results WHERE student_id = ?`,
-            [studentId]
-        );
-        const averageGrade = gradeRows[0].avg_score ? Math.round(gradeRows[0].avg_score) : 0;
+        if (aError) throw aError;
+
+        // Submitted assignments
+        const { count: submittedAssignments, error: subError } = await supabase
+            .from('student_assignment_submissions')
+            .select('*', { count: 'exact', head: true })
+            .eq('student_id', studentId);
+
+        if (subError) throw subError;
+
+        assignmentCompletion = totalAssignments > 0 ? Math.round((submittedAssignments / totalAssignments) * 100) : 0;
+
+        // 3. Average Grades (Exams)
+        const { data: gradeRows, error: gError } = await supabase
+            .from('results')
+            .select('score')
+            .eq('student_id', studentId);
+
+        if (gError) throw gError;
+
+        const scores = gradeRows.map(r => r.score);
+        const averageGrade = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
 
         res.json({
             success: true,
@@ -62,7 +72,6 @@ router.get('/stats', authenticateToken, async (req, res) => {
                 attendance: attendanceRate,
                 assignments: assignmentCompletion,
                 grades: averageGrade,
-                // You can add more specific counts if needed
                 total_attendance_days: totalDays,
                 present_attendance_days: presentDays
             }
@@ -84,22 +93,24 @@ router.get('/performance', authenticateToken, async (req, res) => {
         const studentId = req.user.id;
 
         // Get exam results ordered by date
-        const [results] = await db.query(
-            `SELECT 
-                e.title as exam_name, 
-                r.score, 
-                r.submitted_at as date 
-             FROM results r
-             JOIN exams e ON r.exam_id = e.id
-             WHERE r.student_id = ?
-             ORDER BY r.submitted_at ASC
-             LIMIT 10`,
-            [studentId]
-        );
+        const { data: results, error } = await supabase
+            .from('results')
+            .select('score, submitted_at, exam:exams(title)')
+            .eq('student_id', studentId)
+            .order('submitted_at', { ascending: true })
+            .limit(10);
+
+        if (error) throw error;
+
+        const formattedResults = results.map(r => ({
+            exam_name: r.exam?.title,
+            score: r.score,
+            date: r.submitted_at
+        }));
 
         res.json({
             success: true,
-            performanceData: results
+            performanceData: formattedResults
         });
 
     } catch (error) {

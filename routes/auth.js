@@ -3,7 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 require('dotenv').config();
 
 // Register new admin
@@ -28,12 +28,14 @@ router.post('/register',
       const { username, email, password, full_name, role = 'admin' } = req.body;
 
       // Check if user already exists
-      const [existingUsers] = await db.query(
-        'SELECT * FROM admins WHERE email = ? OR username = ?',
-        [email, username]
-      );
+      const { data: existingUsers, error: fetchError } = await supabase
+        .from('admins')
+        .select('*')
+        .or(`email.eq.${email},username.eq.${username}`);
 
-      if (existingUsers.length > 0) {
+      if (fetchError) throw fetchError;
+
+      if (existingUsers && existingUsers.length > 0) {
         return res.status(400).json({
           success: false,
           message: 'User with this email or username already exists'
@@ -45,14 +47,17 @@ router.post('/register',
       const hashedPassword = await bcrypt.hash(password, salt);
 
       // Insert new admin
-      const [result] = await db.query(
-        'INSERT INTO admins (username, email, password, full_name, role) VALUES (?, ?, ?, ?, ?)',
-        [username, email, hashedPassword, full_name, role]
-      );
+      const { data: newUser, error: insertError } = await supabase
+        .from('admins')
+        .insert([{ username, email, password: hashedPassword, full_name, role }])
+        .select()
+        .single();
+
+      if (insertError) throw insertError;
 
       // Create JWT token
       const token = jwt.sign(
-        { id: result.insertId, username, email, role },
+        { id: newUser.id, username, email, role },
         process.env.JWT_SECRET,
         { expiresIn: '7d' }
       );
@@ -62,7 +67,7 @@ router.post('/register',
         message: 'Admin registered successfully',
         token,
         user: {
-          id: result.insertId,
+          id: newUser.id,
           username,
           email,
           full_name,
@@ -99,12 +104,14 @@ router.post('/login',
       const { email, password } = req.body;
 
       // Check if user exists
-      const [users] = await db.query(
-        'SELECT * FROM admins WHERE email = ?',
-        [email]
-      );
+      const { data: users, error: fetchError } = await supabase
+        .from('admins')
+        .select('*')
+        .eq('email', email);
 
-      if (users.length === 0) {
+      if (fetchError) throw fetchError;
+
+      if (!users || users.length === 0) {
         return res.status(401).json({
           success: false,
           message: 'Invalid credentials'
@@ -166,12 +173,14 @@ router.get('/me', async (req, res) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    const [users] = await db.query(
-      'SELECT id, username, email, full_name, role, created_at FROM admins WHERE id = ?',
-      [decoded.id]
-    );
+    const { data: users, error: fetchError } = await supabase
+      .from('admins')
+      .select('id, username, email, full_name, role, created_at')
+      .eq('id', decoded.id);
 
-    if (users.length === 0) {
+    if (fetchError) throw fetchError;
+
+    if (!users || users.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'User not found'

@@ -1,18 +1,18 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/database');
+const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
 // Get all approved testimonials (public)
 router.get('/approved', async (req, res) => {
   try {
-    const [testimonials] = await db.query(
-      `SELECT id, full_name, program, graduation_year, rating, testimonial_text, 
-              profile_image, created_at 
-       FROM testimonials 
-       WHERE status = 'approved' 
-       ORDER BY created_at DESC`
-    );
+    const { data: testimonials, error } = await supabase
+      .from('testimonials')
+      .select('id, full_name, program, graduation_year, rating, testimonial_text, profile_image, created_at')
+      .eq('status', 'approved')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
     res.json(testimonials);
   } catch (error) {
     console.error('Error fetching approved testimonials:', error);
@@ -36,8 +36,8 @@ router.post('/submit', async (req, res) => {
 
     // Validation
     if (!full_name || !email || !program || !rating || !testimonial_text) {
-      return res.status(400).json({ 
-        error: 'Please provide all required fields: full_name, email, program, rating, and testimonial_text' 
+      return res.status(400).json({
+        error: 'Please provide all required fields: full_name, email, program, rating, and testimonial_text'
       });
     }
 
@@ -46,16 +46,27 @@ router.post('/submit', async (req, res) => {
     }
 
     // Insert testimonial
-    const [result] = await db.query(
-      `INSERT INTO testimonials 
-       (full_name, email, phone_number, program, graduation_year, rating, testimonial_text, profile_image, status) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
-      [full_name, email, phone_number, program, graduation_year, rating, testimonial_text, profile_image]
-    );
+    const { data: result, error } = await supabase
+      .from('testimonials')
+      .insert([{
+        full_name,
+        email,
+        phone_number,
+        program,
+        graduation_year,
+        rating,
+        testimonial_text,
+        profile_image,
+        status: 'pending'
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
 
     res.status(201).json({
       message: 'Testimonial submitted successfully! It will be reviewed by our admin team.',
-      testimonial_id: result.insertId
+      testimonial_id: result.id
     });
   } catch (error) {
     console.error('Error submitting testimonial:', error);
@@ -66,13 +77,20 @@ router.post('/submit', async (req, res) => {
 // Get all testimonials (admin only)
 router.get('/all', authenticateToken, async (req, res) => {
   try {
-    const [testimonials] = await db.query(
-      `SELECT t.*, a.full_name as approved_by_name
-       FROM testimonials t
-       LEFT JOIN admins a ON t.approved_by = a.id
-       ORDER BY t.created_at DESC`
-    );
-    res.json(testimonials);
+    const { data: testimonials, error } = await supabase
+      .from('testimonials')
+      .select('*, approved_by:admins(full_name)')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const formattedTestimonials = testimonials.map(t => ({
+      ...t,
+      approved_by_name: t.approved_by?.full_name || null,
+      approved_by: t.approved_by ? undefined : null
+    }));
+
+    res.json(formattedTestimonials);
   } catch (error) {
     console.error('Error fetching all testimonials:', error);
     res.status(500).json({ error: 'Failed to fetch testimonials' });
@@ -83,20 +101,26 @@ router.get('/all', authenticateToken, async (req, res) => {
 router.get('/status/:status', authenticateToken, async (req, res) => {
   try {
     const { status } = req.params;
-    
+
     if (!['pending', 'approved', 'rejected'].includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
-    const [testimonials] = await db.query(
-      `SELECT t.*, a.full_name as approved_by_name
-       FROM testimonials t
-       LEFT JOIN admins a ON t.approved_by = a.id
-       WHERE t.status = ?
-       ORDER BY t.created_at DESC`,
-      [status]
-    );
-    res.json(testimonials);
+    const { data: testimonials, error } = await supabase
+      .from('testimonials')
+      .select('*, approved_by:admins(full_name)')
+      .eq('status', status)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const formattedTestimonials = testimonials.map(t => ({
+      ...t,
+      approved_by_name: t.approved_by?.full_name || null,
+      approved_by: t.approved_by ? undefined : null
+    }));
+
+    res.json(formattedTestimonials);
   } catch (error) {
     console.error('Error fetching testimonials by status:', error);
     res.status(500).json({ error: 'Failed to fetch testimonials' });
@@ -106,20 +130,26 @@ router.get('/status/:status', authenticateToken, async (req, res) => {
 // Get single testimonial (admin only)
 router.get('/:id', authenticateToken, async (req, res) => {
   try {
-    const { id } = req.params;
-    const [testimonials] = await db.query(
-      `SELECT t.*, a.full_name as approved_by_name
-       FROM testimonials t
-       LEFT JOIN admins a ON t.approved_by = a.id
-       WHERE t.id = ?`,
-      [id]
-    );
+    const { data: testimonial, error } = await supabase
+      .from('testimonials')
+      .select('*, approved_by:admins(full_name)')
+      .eq('id', req.params.id)
+      .single();
 
-    if (testimonials.length === 0) {
-      return res.status(404).json({ error: 'Testimonial not found' });
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Testimonial not found' });
+      }
+      throw error;
     }
 
-    res.json(testimonials[0]);
+    const formattedTestimonial = {
+      ...testimonial,
+      approved_by_name: testimonial.approved_by?.full_name || null,
+      approved_by: testimonial.approved_by ? undefined : null
+    };
+
+    res.json(formattedTestimonial);
   } catch (error) {
     console.error('Error fetching testimonial:', error);
     res.status(500).json({ error: 'Failed to fetch testimonial' });
@@ -133,19 +163,17 @@ router.put('/:id/approve', authenticateToken, async (req, res) => {
     const { admin_notes } = req.body;
     const adminId = req.user.id;
 
-    const [result] = await db.query(
-      `UPDATE testimonials 
-       SET status = 'approved', 
-           approved_by = ?, 
-           approved_at = NOW(),
-           admin_notes = ?
-       WHERE id = ?`,
-      [adminId, admin_notes, id]
-    );
+    const { error, count } = await supabase
+      .from('testimonials')
+      .update({
+        status: 'approved',
+        approved_by: adminId,
+        approved_at: new Date().toISOString(),
+        admin_notes: admin_notes || null
+      })
+      .eq('id', id);
 
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'Testimonial not found' });
-    }
+    if (error) throw error;
 
     res.json({ message: 'Testimonial approved successfully' });
   } catch (error) {
@@ -161,19 +189,17 @@ router.put('/:id/reject', authenticateToken, async (req, res) => {
     const { admin_notes } = req.body;
     const adminId = req.user.id;
 
-    const [result] = await db.query(
-      `UPDATE testimonials 
-       SET status = 'rejected', 
-           approved_by = ?, 
-           approved_at = NOW(),
-           admin_notes = ?
-       WHERE id = ?`,
-      [adminId, admin_notes, id]
-    );
+    const { error } = await supabase
+      .from('testimonials')
+      .update({
+        status: 'rejected',
+        approved_by: adminId,
+        approved_at: new Date().toISOString(),
+        admin_notes: admin_notes || null
+      })
+      .eq('id', id);
 
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'Testimonial not found' });
-    }
+    if (error) throw error;
 
     res.json({ message: 'Testimonial rejected' });
   } catch (error) {
@@ -185,11 +211,13 @@ router.put('/:id/reject', authenticateToken, async (req, res) => {
 // Delete testimonial (admin only)
 router.delete('/:id', authenticateToken, async (req, res) => {
   try {
-    const { id } = req.params;
+    const { error, count } = await supabase
+      .from('testimonials')
+      .delete({ count: 'exact' })
+      .eq('id', req.params.id);
 
-    const [result] = await db.query('DELETE FROM testimonials WHERE id = ?', [id]);
-
-    if (result.affectedRows === 0) {
+    if (error) throw error;
+    if (count === 0) {
       return res.status(404).json({ error: 'Testimonial not found' });
     }
 
@@ -203,17 +231,24 @@ router.delete('/:id', authenticateToken, async (req, res) => {
 // Get testimonial statistics (admin only)
 router.get('/stats/overview', authenticateToken, async (req, res) => {
   try {
-    const [stats] = await db.query(`
-      SELECT 
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-        SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
-        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected,
-        AVG(CASE WHEN status = 'approved' THEN rating ELSE NULL END) as average_rating
-      FROM testimonials
-    `);
+    const { data: testimonials, error } = await supabase
+      .from('testimonials')
+      .select('status, rating');
 
-    res.json(stats[0]);
+    if (error) throw error;
+
+    const approvedTestimonials = testimonials.filter(t => t.status === 'approved');
+    const totalRating = approvedTestimonials.reduce((sum, t) => sum + t.rating, 0);
+
+    const stats = {
+      total: testimonials.length,
+      pending: testimonials.filter(t => t.status === 'pending').length,
+      approved: approvedTestimonials.length,
+      rejected: testimonials.filter(t => t.status === 'rejected').length,
+      average_rating: approvedTestimonials.length > 0 ? totalRating / approvedTestimonials.length : 0
+    };
+
+    res.json(stats);
   } catch (error) {
     console.error('Error fetching testimonial stats:', error);
     res.status(500).json({ error: 'Failed to fetch statistics' });
