@@ -114,17 +114,18 @@ app.use((err, req, res, next) => {
 
 // Function to get next available port
 const getPort = (port) => {
+  const portNum = parseInt(port, 10);
   const server = require('http').createServer();
   return new Promise((resolve, reject) => {
     server.on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
-        console.log(`Port ${port} is in use, trying port ${port + 1}...`);
-        resolve(getPort(port + 1));
+        console.log(`Port ${portNum} is in use, trying port ${portNum + 1}...`);
+        resolve(getPort(portNum + 1));
       } else {
         reject(err);
       }
     });
-    server.listen(port, () => {
+    server.listen(portNum, () => {
       const usedPort = server.address().port;
       server.close();
       resolve(usedPort);
