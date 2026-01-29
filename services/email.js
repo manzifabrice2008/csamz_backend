@@ -16,12 +16,12 @@ const createTransporter = () => {
     console.warn('⚠️  Email service not configured. Set EMAIL_USER and EMAIL_PASSWORD in .env file.');
     return null;
   }
-  
+
   // Return cached transporter if available
   if (cachedTransporter) {
     return cachedTransporter;
   }
-  
+
   const port = Number(process.env.EMAIL_PORT) || 587;
   const host = process.env.EMAIL_HOST || 'smtp.gmail.com';
 
@@ -143,7 +143,7 @@ If you did not request a password reset, please ignore this email.
 const sendApplicationConfirmation = async (studentData) => {
   try {
     const transporter = createTransporter();
-    
+
     if (!transporter) {
       console.log('📧 Email not configured - Skipping application confirmation email');
       return { success: false, error: 'Email service not configured' };
@@ -249,7 +249,7 @@ Email: ${process.env.EMAIL_USER}
 const sendApplicationStatusUpdate = async (studentData, status, adminNotes = '') => {
   try {
     const transporter = createTransporter();
-    
+
     if (!transporter) {
       console.log('📧 Email not configured - Skipping status update email');
       return { success: false, error: 'Email service not configured' };
@@ -387,7 +387,7 @@ Email: ${process.env.EMAIL_USER}
 const sendAdminNotification = async (studentData) => {
   try {
     const transporter = createTransporter();
-    
+
     if (!transporter) {
       console.log('📧 Email not configured - Skipping admin notification email');
       return { success: false, error: 'Email service not configured' };
@@ -469,9 +469,120 @@ const sendAdminNotification = async (studentData) => {
   }
 };
 
+// Send teacher status update email
+const sendTeacherStatusUpdate = async (teacher, status) => {
+  try {
+    const transporter = createTransporter();
+
+    if (!transporter) {
+      console.log('📧 Email not configured - Skipping teacher status update email');
+      return { success: false, error: 'Email service not configured' };
+    }
+
+    const isApproved = status === 'approved';
+    const statusColor = isApproved ? '#10b981' : '#ef4444';
+    const statusText = isApproved ? 'Account Approved ✅' : 'Account Status Updated';
+    const statusEmoji = isApproved ? '🎊' : '📝';
+
+    const loginUrl = process.env.TEACHER_APP_URL || 'http://localhost:5173/teacher/login';
+
+    const mailOptions = {
+      from: `"CSAM Zaccaria TVET" <${process.env.EMAIL_USER}>`,
+      to: teacher.email,
+      subject: `Teacher Account ${isApproved ? 'Approved' : 'Status Update'} - CSAM Zaccaria TVET`,
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+            .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+            .header { background: ${statusColor}; color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+            .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+            .status-box { background: white; padding: 20px; margin: 20px 0; border-left: 4px solid ${statusColor}; border-radius: 5px; text-align: center; }
+            .footer { text-align: center; margin-top: 30px; color: #666; font-size: 12px; }
+            .button { display: inline-block; padding: 12px 30px; background: ${statusColor}; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+            h1 { margin: 0; font-size: 28px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>${statusEmoji} ${statusText}</h1>
+            </div>
+            <div class="content">
+              <p>Dear <strong>${teacher.full_name || teacher.username}</strong>,</p>
+              
+              ${isApproved ? `
+                <div class="status-box">
+                  <h2 style="color: ${statusColor}; margin: 0;">Congratulations!</h2>
+                  <p style="font-size: 18px; margin: 10px 0;">Your teacher account has been <strong>APPROVED</strong>!</p>
+                </div>
+                
+                <p>We are excited to have you join our teaching staff. You can now log in to the teacher dashboard using your registered email and password.</p>
+                
+                <p style="text-align: center;">
+                  <a href="${loginUrl}" class="button">Log in to Dashboard</a>
+                </p>
+                
+                <h3>What you can do now:</h3>
+                <ul>
+                  <li>Create and manage student exams</li>
+                  <li>Track student results and performance</li>
+                  <li>Upload assignments and learning materials</li>
+                  <li>Mark student attendance</li>
+                </ul>
+              ` : `
+                <div class="status-box">
+                  <h2 style="color: ${statusColor}; margin: 0;">Account Status Update</h2>
+                  <p style="font-size: 18px; margin: 10px 0;">Status: <strong>${status.toUpperCase()}</strong></p>
+                </div>
+                
+                <p>Your teacher account status has been updated to <strong>${status}</strong>.</p>
+                
+                ${status === 'rejected' ? `
+                  <p>Unfortunately, your application to join as a teacher has been rejected at this time. If you believe this is an error, please contact the school administration.</p>
+                ` : ''}
+              `}
+              
+              <div class="footer">
+                <p><strong>CSAM Zaccaria TVET</strong></p>
+                <p>Center for Skill Acquisition and Management</p>
+                <p>Email: ${process.env.EMAIL_USER}</p>
+                <p>&copy; ${new Date().getFullYear()} CSAM Zaccaria TVET. All rights reserved.</p>
+              </div>
+            </div>
+          </div>
+        </body>
+        </html>
+      `,
+      text: `
+Dear ${teacher.full_name || teacher.username},
+
+${isApproved ? 'Congratulations! Your teacher account has been APPROVED!' : 'Your teacher account status has been updated.'}
+
+Status: ${status.toUpperCase()}
+
+${isApproved ? `You can now log in to the teacher dashboard here: ${loginUrl}` : ''}
+
+Best regards,
+CSAM Zaccaria TVET
+      `,
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+    console.log('Teacher status update email sent:', info.messageId);
+    return { success: true, messageId: info.messageId };
+  } catch (error) {
+    console.error('Error sending teacher status update email:', error.message);
+    return { success: false, error: error.message };
+  }
+};
+
 module.exports = {
   sendApplicationConfirmation,
   sendApplicationStatusUpdate,
   sendAdminNotification,
   sendAdminPasswordReset,
+  sendTeacherStatusUpdate,
 };

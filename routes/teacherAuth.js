@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const { supabase } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { sendTeacherStatusUpdate } = require('../services/email');
 require('dotenv').config();
 
 const TEACHER_JWT_EXPIRY = '7d';
@@ -221,6 +222,20 @@ router.patch(
         .eq('id', teacherId);
 
       if (error) throw error;
+
+      // Fetch teacher details for email
+      const { data: teacher } = await supabase
+        .from('teachers')
+        .select('email, full_name, username')
+        .eq('id', teacherId)
+        .single();
+
+      if (teacher) {
+        // Send email notification (async, don't block response)
+        sendTeacherStatusUpdate(teacher, status).catch(err =>
+          console.error('Failed to send teacher status update email:', err)
+        );
+      }
 
       res.json({ success: true, message: `Teacher status updated to ${status}` });
     } catch (error) {

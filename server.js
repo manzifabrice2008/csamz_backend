@@ -63,6 +63,8 @@ const teacherAssignmentsRoutes = require('./routes/teacherAssignments');
 const teacherAttendanceRoutes = require('./routes/teacherAttendance');
 const examsRoutes = require('./routes/exams');
 const resultsRoutes = require('./routes/results');
+const adminStudentsRoutes = require('./routes/adminStudents');
+const analyticsRoutes = require('./routes/analytics');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/news', newsRoutes);
@@ -85,6 +87,8 @@ app.use('/api/blog', blogRoutes);
 app.use('/api/transfers', institutionTransfersRoutes);
 app.use('/api/exams', examsRoutes);
 app.use('/api/results', resultsRoutes);
+app.use('/api/admin/students', adminStudentsRoutes);
+app.use('/api/analytics', analyticsRoutes);
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {

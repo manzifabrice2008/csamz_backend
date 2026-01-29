@@ -47,9 +47,10 @@ const normalizeQuestion = (row, includeAnswer = true) => ({
   options: row.type === 'TF' ? ['True', 'False'] : safeParseOptions(row.options, []),
   correct_answer: includeAnswer ? row.correct_answer : undefined,
   marks: row.marks,
+  time_limit: row.time_limit || 30,
 });
 
-router.get('/', async (req, res) => {
+router.get('/', authenticateToken, async (req, res) => {
   try {
     const { teacherId } = req.query;
 
@@ -65,9 +66,23 @@ router.get('/', async (req, res) => {
 
     if (error) throw error;
 
-    const formattedExams = exams.map(e => ({
-      ...e,
-      question_count: e.questions?.length || 0
+    const formattedExams = await Promise.all(exams.map(async (e) => {
+      let already_taken = false;
+      if (req.user && req.user.role === 'student') {
+        const { data: result } = await supabase
+          .from('results')
+          .select('id')
+          .eq('student_id', req.user.id)
+          .eq('exam_id', e.id)
+          .maybeSingle();
+        if (result) already_taken = true;
+      }
+
+      return {
+        ...e,
+        question_count: e.questions?.length || 0,
+        already_taken
+      };
     }));
 
     res.json({
@@ -306,11 +321,23 @@ router.get('/:id/questions', async (req, res) => {
         ? exam.total_marks
         : questionRows.reduce((sum, q) => sum + (q.marks || 0), 0);
 
+    let already_taken = false;
+    if (req.user && req.user.role === 'student') {
+      const { data: result } = await supabase
+        .from('results')
+        .select('id')
+        .eq('student_id', req.user.id)
+        .eq('exam_id', examId)
+        .maybeSingle();
+      if (result) already_taken = true;
+    }
+
     res.json({
       success: true,
       exam: {
         ...exam,
         total_marks: totalMarks,
+        already_taken,
       },
       questions,
     });
@@ -337,7 +364,7 @@ router.get('/:id/manage', authenticateToken, ensureStaff, async (req, res) => {
 
     const { data: questionRows, error: qError } = await supabase
       .from('questions')
-      .select('id, question_text, type, options, correct_answer, marks')
+      .select('id, question_text, type, options, correct_answer, marks, time_limit')
       .eq('exam_id', examId)
       .order('id', { ascending: true });
 
@@ -372,6 +399,7 @@ router.post(
       .withMessage('MCQ questions require at least two options'),
     body('correct_answer').trim().notEmpty().withMessage('Correct answer is required'),
     body('marks').isInt({ min: 1 }).withMessage('Marks must be at least 1'),
+    body('time_limit').optional().isInt({ min: 5 }).withMessage('Time limit must be at least 5 seconds'),
   ],
   async (req, res) => {
     try {
@@ -381,7 +409,7 @@ router.post(
       }
 
       const examId = req.params.id;
-      const { question_text, type, options, correct_answer, marks } = req.body;
+      const { question_text, type, options, correct_answer, marks, time_limit = 30 } = req.body;
 
       const { data, error } = await supabase
         .from('questions')
@@ -391,7 +419,8 @@ router.post(
           type,
           options: type === 'MCQ' ? (typeof options === 'string' ? options : JSON.stringify(options)) : null,
           correct_answer,
-          marks
+          marks,
+          time_limit
         }])
         .select()
         .single();
@@ -417,6 +446,7 @@ router.put(
   [
     body('question_text').optional().trim().notEmpty(),
     body('type').optional().isIn(['MCQ', 'TF']),
+    body('time_limit').optional().isInt({ min: 5 }),
     body('options')
       .optional()
       .custom((value, { req }) => {
@@ -451,6 +481,7 @@ router.put(
         type,
         correct_answer: req.body.correct_answer || existing.correct_answer,
         marks: req.body.marks || existing.marks,
+        time_limit: req.body.time_limit || existing.time_limit,
         options: type === 'MCQ' ? (req.body.options ? JSON.stringify(req.body.options) : existing.options) : null,
         updated_at: new Date().toISOString()
       };
@@ -513,6 +544,21 @@ router.post(
       const examId = req.params.id;
       const studentId = req.user.id;
       const answersPayload = req.body.answers;
+
+      // Check if student already took this exam
+      const { data: existingResult } = await supabase
+        .from('results')
+        .select('id')
+        .eq('student_id', studentId)
+        .eq('exam_id', examId)
+        .maybeSingle();
+
+      if (existingResult) {
+        return res.status(400).json({
+          success: false,
+          message: 'You have already submitted this exam and cannot retake it.'
+        });
+      }
 
       const { data: exam, error: examError } = await supabase.from('exams').select('*').eq('id', examId).single();
       if (examError) throw examError;
@@ -640,10 +686,26 @@ router.get('/:id/results', authenticateToken, ensureStaff, async (req, res) => {
       };
     });
 
+    // Calculate Statistics
+    const totalSubmissions = resultsWithGrades.length;
+    const passCount = resultsWithGrades.filter(r => r.percentage >= 50).length;
+    const failCount = totalSubmissions - passCount;
+    const winningRate = totalSubmissions > 0 ? Math.round((passCount / totalSubmissions) * 100) : 0;
+    const averageScore = totalSubmissions > 0
+      ? Math.round(resultsWithGrades.reduce((sum, r) => sum + r.percentage, 0) / totalSubmissions)
+      : 0;
+
     res.json({
       success: true,
       exam_title: exam.title,
       results: resultsWithGrades,
+      stats: {
+        total_submissions: totalSubmissions,
+        pass_count: passCount,
+        fail_count: failCount,
+        winning_rate: winningRate,
+        average_score: averageScore
+      }
     });
   } catch (error) {
     console.error('List exam results error:', error);
