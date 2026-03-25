@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../config/database');
+const Notification = require('../models/Notification');
 const { authenticateToken } = require('../middleware/auth');
 
 // Get notifications
@@ -10,34 +10,27 @@ router.get('/', authenticateToken, async (req, res) => {
             return res.status(403).json({ success: false, message: 'Access denied' });
         }
 
-        const userType = req.user.role; // 'student', 'teacher', 'admin'
-        let dbUserType = userType;
-        if (userType === 'super_admin') dbUserType = 'admin';
+        let userType = req.user.role;
+        if (userType === 'super_admin') userType = 'admin';
 
-        const { data: notifications, error } = await supabase
-            .from('notifications')
-            .select('*')
-            .eq('user_id', req.user.id)
-            .eq('user_type', dbUserType)
-            .order('created_at', { ascending: false })
-            .limit(50);
+        const notifications = await Notification.find({
+            user_id: req.user.id,
+            user_type: userType
+        }).sort({ createdAt: -1 }).limit(50).lean();
 
-        if (error) throw error;
+        // Map _id to id to maintain backwards compatibility
+        const mapped = notifications.map(n => ({ id: n._id, ...n }));
 
-        // Get unread count
-        const { count, error: countError } = await supabase
-            .from('notifications')
-            .select('*', { count: 'exact', head: true })
-            .eq('user_id', req.user.id)
-            .eq('user_type', dbUserType)
-            .eq('is_read', false);
-
-        if (countError) throw countError;
+        const unreadCount = await Notification.countDocuments({
+            user_id: req.user.id,
+            user_type: userType,
+            is_read: false
+        });
 
         res.json({
             success: true,
-            notifications,
-            unreadCount: count || 0
+            notifications: mapped,
+            unreadCount: unreadCount || 0
         });
     } catch (error) {
         console.error('Get notifications error:', error);
@@ -50,13 +43,10 @@ router.put('/:id/read', authenticateToken, async (req, res) => {
     try {
         const notificationId = req.params.id;
 
-        const { error } = await supabase
-            .from('notifications')
-            .update({ is_read: true })
-            .eq('id', notificationId)
-            .eq('user_id', req.user.id);
-
-        if (error) throw error;
+        await Notification.findOneAndUpdate(
+            { _id: notificationId, user_id: req.user.id },
+            { is_read: true }
+        );
 
         res.json({ success: true });
     } catch (error) {
@@ -70,13 +60,10 @@ router.put('/read-all', authenticateToken, async (req, res) => {
     try {
         const userType = req.user.role === 'super_admin' ? 'admin' : req.user.role;
 
-        const { error } = await supabase
-            .from('notifications')
-            .update({ is_read: true })
-            .eq('user_id', req.user.id)
-            .eq('user_type', userType);
-
-        if (error) throw error;
+        await Notification.updateMany(
+            { user_id: req.user.id, user_type: userType },
+            { is_read: true }
+        );
 
         res.json({ success: true });
     } catch (error) {

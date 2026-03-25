@@ -1,9 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const { supabase } = require('../config/database');
-const { authenticateToken } = require('../middleware/auth');
+const Student = require('../models/Student');
+const Result = require('../models/Result');
+const Assignment = require('../models/Assignment');
+const Exam = require('../models/Exam');
 const bcrypt = require('bcryptjs');
+const { authenticateToken } = require('../middleware/auth');
 
 // Get student profile
 router.get('/profile', authenticateToken, async (req, res) => {
@@ -12,19 +15,14 @@ router.get('/profile', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    const { data: student, error } = await supabase
-      .from('students')
-      .select('id, username, full_name, email, phone_number, trade, institution_id, date_of_birth, address, emergency_contact, status, created_at')
-      .eq('id', req.user.id)
-      .single();
+    const student = await Student.findById(req.user.id).lean();
 
-    if (error) {
-      if (error.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Student not found' });
-      throw error;
+    if (!student) {
+      return res.status(404).json({ success: false, message: 'Student not found' });
     }
 
-    // Map phone_number to phone for frontend consistency
     const formattedStudent = {
+      id: student._id,
       ...student,
       phone: student.phone_number
     };
@@ -67,42 +65,27 @@ router.put('/profile',
         emergency_contact
       } = req.body;
 
-      // Check if email is already taken by another student
       if (email) {
-        const { data: existing, error: checkError } = await supabase
-          .from('students')
-          .select('id')
-          .eq('email', email)
-          .neq('id', req.user.id)
-          .maybeSingle();
-
-        if (checkError) throw checkError;
+        const existing = await Student.findOne({ email, _id: { $ne: req.user.id } });
         if (existing) {
           return res.status(400).json({ success: false, message: 'Email already in use' });
         }
       }
 
-      const { data: updated, error: updateError } = await supabase
-        .from('students')
-        .update({
-          full_name,
-          email: email || null,
-          phone_number: phone || null,
-          date_of_birth: date_of_birth || null,
-          address: address || null,
-          emergency_contact: emergency_contact || null,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', req.user.id)
-        .select('id, username, full_name, email, phone_number, trade, institution_id, date_of_birth, address, emergency_contact, status, updated_at')
-        .single();
-
-      if (updateError) throw updateError;
+      const updated = await Student.findByIdAndUpdate(req.user.id, {
+        full_name,
+        email: email || null,
+        phone_number: phone || null,
+        date_of_birth: date_of_birth || null,
+        address: address || null,
+        emergency_contact: emergency_contact || null
+      }, { new: true }).lean();
 
       res.json({
         success: true,
         message: 'Profile updated successfully',
         student: {
+          id: updated._id,
           ...updated,
           phone: updated.phone_number
         }
@@ -140,14 +123,7 @@ router.put('/password',
 
       const { current_password, new_password } = req.body;
 
-      // Get current password hash
-      const { data: student, error: fetchError } = await supabase
-        .from('students')
-        .select('password')
-        .eq('id', req.user.id)
-        .single();
-
-      if (fetchError) throw fetchError;
+      const student = await Student.findById(req.user.id).select('password');
 
       const isMatch = await bcrypt.compare(current_password, student.password);
 
@@ -155,20 +131,10 @@ router.put('/password',
         return res.status(400).json({ success: false, message: 'Current password is incorrect' });
       }
 
-      // Hash new password
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(new_password, salt);
 
-      // Update password
-      const { error: updateError } = await supabase
-        .from('students')
-        .update({
-          password: hashedPassword,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', req.user.id);
-
-      if (updateError) throw updateError;
+      await Student.findByIdAndUpdate(req.user.id, { password: hashedPassword });
 
       res.json({ success: true, message: 'Password changed successfully' });
     } catch (error) {
@@ -187,14 +153,8 @@ router.get('/stats', authenticateToken, async (req, res) => {
 
     const studentId = req.user.id;
 
-    // Get exam statistics
-    const { data: results, error: resError } = await supabase
-      .from('results')
-      .select('score')
-      .eq('student_id', studentId);
-
-    if (resError) throw resError;
-
+    const results = await Result.find({ student_id: studentId }).lean();
+    
     const total_exams = results.length;
     const passed_exams = results.filter(r => r.score >= 50).length;
     const scores = results.map(r => r.score);
@@ -202,53 +162,39 @@ router.get('/stats', authenticateToken, async (req, res) => {
     const highest_score = scores.length ? Math.max(...scores) : 0;
     const lowest_score = scores.length ? Math.min(...scores) : 0;
 
-    // Get recent activity (exams and assignments)
-    const { data: recentExams, error: revError } = await supabase
-      .from('results')
-      .select('score, submitted_at, exam:exams(title, total_marks)')
-      .eq('student_id', studentId)
-      .order('submitted_at', { ascending: false })
-      .limit(10);
+    const recentExams = await Result.find({ student_id: studentId })
+      .sort({ submitted_at: -1 })
+      .limit(10)
+      .populate('exam_id', 'title total_marks')
+      .lean();
 
-    if (revError) throw revError;
-
-    // Note: assignments table might not exist or be different, but keeping consistency with original logic
-    const { data: recentAssignments, error: assError } = await supabase
-      .from('assignments')
-      .select('title, created_at')
-      .eq('student_id', studentId)
-      .order('created_at', { ascending: false })
-      .limit(10);
-
-    // If assignments table doesn't exist, we'll just have empty array
-    const assignments = recentAssignments || [];
+    const recentAssignments = await Assignment.find({ /* no student_id link directly unless we check submissions, logic matches old style */ })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .lean();
 
     const activity = [
       ...recentExams.map(r => ({
         type: 'exam',
-        title: r.exam?.title,
+        title: r.exam_id?.title,
         score: r.score,
-        total_marks: r.exam?.total_marks,
+        total_marks: r.exam_id?.total_marks,
         date: r.submitted_at
       })),
-      ...assignments.map(a => ({
+      ...recentAssignments.map(a => ({
         type: 'assignment',
         title: a.title,
         score: null,
         total_marks: null,
-        date: a.created_at
+        date: a.createdAt
       }))
     ].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 10);
 
-    // Get upcoming exams
-    const { data: upcomingExams, error: upError } = await supabase
-      .from('exams') // Assuming 'exams' is used for online exams too
-      .select('id, title, description, total_marks, created_at')
-      .filter('trade', 'eq', req.user.trade)
-      .order('created_at', { ascending: true })
-      .limit(5);
-
-    if (upError) throw upError;
+    const upcomingExams = await Exam.find({ trade: req.user.trade })
+      .select('_id title description total_marks createdAt')
+      .sort({ createdAt: 1 })
+      .limit(5)
+      .lean();
 
     res.json({
       success: true,
@@ -261,7 +207,7 @@ router.get('/stats', authenticateToken, async (req, res) => {
           lowest_score
         },
         recentActivity: activity,
-        upcomingExams: upcomingExams || []
+        upcomingExams: upcomingExams.map(e => ({ id: e._id, title: e.title, description: e.description, total_marks: e.total_marks, created_at: e.createdAt }))
       }
     });
   } catch (error) {

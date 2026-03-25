@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../config/database');
+const Attendance = require('../models/Attendance');
+const Teacher = require('../models/Teacher');
+const Student = require('../models/Student');
 const { authenticateToken } = require('../middleware/auth');
 const { body, validationResult } = require('express-validator');
 
@@ -28,21 +30,23 @@ router.post('/', authenticateToken, ensureTeacher, [
         const teacherId = req.user.id;
         const { date, attendance } = req.body;
 
-        const dateStr = date.toISOString().slice(0, 10); // Use YYYY-MM-DD for attendance uniqueness usually
+        const dateStr = date.toISOString().slice(0, 10); // YYYY-MM-DD
 
-        const upsertPayload = attendance.map(record => ({
-            student_id: record.student_id,
-            date: dateStr,
-            status: record.status,
-            remarks: record.remarks || null,
-            recorded_by: teacherId
+        const bulkOps = attendance.map(record => ({
+            updateOne: {
+                filter: { student_id: record.student_id, date: dateStr },
+                update: {
+                    $set: {
+                        status: record.status,
+                        remarks: record.remarks || null,
+                        recorded_by: teacherId
+                    }
+                },
+                upsert: true
+            }
         }));
 
-        const { error } = await supabase
-            .from('attendance')
-            .upsert(upsertPayload, { onConflict: 'student_id,date' });
-
-        if (error) throw error;
+        await Attendance.bulkWrite(bulkOps);
 
         res.json({ success: true, message: 'Attendance recorded successfully' });
 
@@ -57,36 +61,43 @@ router.get('/history', authenticateToken, ensureTeacher, async (req, res) => {
     try {
         const { date, student_id } = req.query;
 
-        // Filter by teacher's trade (security so they don't see others)
-        const { data: teacher, error: tError } = await supabase
-            .from('teachers')
-            .select('trade')
-            .eq('id', req.user.id)
-            .single();
+        const teacher = await Teacher.findById(req.user.id).select('trade').lean();
+        if (!teacher) throw new Error('Teacher not found');
 
-        if (tError) throw tError;
-
-        let query = supabase
-            .from('attendance')
-            .select('*, student:students!inner(full_name, trade)')
-            .eq('student.trade', teacher.trade);
-
-        if (date) {
-            query = query.eq('date', date);
-        }
-
+        let studentIdsToQuery = [];
+        
         if (student_id) {
-            query = query.eq('student_id', student_id);
+            // Verify student is in teacher's trade
+            const student = await Student.findOne({ _id: student_id, trade: teacher.trade }).lean();
+            if (student) {
+                studentIdsToQuery.push(student._id);
+            }
+        } else {
+            // Get all students in teacher's trade
+            const studentsInTrade = await Student.find({ trade: teacher.trade }).select('_id').lean();
+            studentIdsToQuery = studentsInTrade.map(s => s._id);
         }
 
-        const { data: rows, error } = await query.order('date', { ascending: false });
+        if (studentIdsToQuery.length === 0) {
+            return res.json({ success: true, attendance: [] });
+        }
 
-        if (error) throw error;
+        const query = { student_id: { $in: studentIdsToQuery } };
+        if (date) {
+            query.date = date;
+        }
+
+        const rows = await Attendance.find(query)
+            .sort({ date: -1 })
+            .populate('student_id', 'full_name trade')
+            .lean();
 
         const formattedRows = rows.map(row => ({
+            id: row._id,
             ...row,
-            full_name: row.student?.full_name,
-            trade: row.student?.trade
+            full_name: row.student_id?.full_name,
+            trade: row.student_id?.trade,
+            student_id: row.student_id?._id
         }));
 
         res.json({ success: true, attendance: formattedRows });

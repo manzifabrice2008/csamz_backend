@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../config/database');
+const Exam = require('../models/Exam');
+const Result = require('../models/Result');
+const Question = require('../models/Question');
+const StudentAnswer = require('../models/StudentAnswer');
 const { authenticateToken } = require('../middleware/auth');
 
 const STAFF_ROLES = new Set(['admin', 'super_admin']);
@@ -33,35 +36,23 @@ router.get('/history', authenticateToken, async (req, res) => {
 
     const studentId = req.user.id;
 
-    const { data: results, error } = await supabase
-      .from('results')
-      .select(`
-        id,
-        exam_id,
-        score,
-        submitted_at,
-        exam:exams (
-          title,
-          total_marks
-        )
-      `)
-      .eq('student_id', studentId)
-      .order('submitted_at', { ascending: false });
-
-    if (error) throw error;
+    const results = await Result.find({ student_id: studentId })
+      .populate('exam_id', 'title total_marks')
+      .sort({ submitted_at: -1 })
+      .lean();
 
     const formattedResults = results.map(row => {
-      const total_marks = row.exam?.total_marks || 0;
+      const total_marks = row.exam_id?.total_marks || 0;
       const percentage = total_marks > 0 ? (row.score / total_marks) * 100 : 0;
       return {
-        id: row.id,
-        examId: row.exam_id,
-        examTitle: row.exam?.title || 'Unknown Exam',
+        id: row._id,
+        examId: row.exam_id?._id,
+        examTitle: row.exam_id?.title || 'Unknown Exam',
         score: row.score,
         totalMarks: total_marks,
         percentage: Math.round(percentage),
         grade: getGrade(percentage),
-        submittedAt: row.submitted_at
+        submittedAt: row.submitted_at || row.createdAt
       };
     });
 
@@ -88,53 +79,33 @@ router.get('/:studentId/:examId', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied for this result' });
     }
 
-    const { data: exam, error: examError } = await supabase
-      .from('exams')
-      .select('*')
-      .eq('id', examId)
-      .single();
-
-    if (examError) {
-      if (examError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Exam not found' });
-      throw examError;
+    const exam = await Exam.findById(examId).lean();
+    if (!exam) {
+      return res.status(404).json({ success: false, message: 'Exam not found' });
     }
 
-    const { data: result, error: resultError } = await supabase
-      .from('results')
-      .select('score, submitted_at')
-      .eq('student_id', studentId)
-      .eq('exam_id', examId)
-      .maybeSingle();
-
-    if (resultError) throw resultError;
+    const result = await Result.findOne({ student_id: studentId, exam_id: examId }).select('score submitted_at createdAt').lean();
     if (!result) {
       return res.status(404).json({ success: false, message: 'Result not found for this student' });
     }
 
-    const { data: answers, error: answersError } = await supabase
-      .from('questions')
-      .select(`
-        id,
-        question_text,
-        type,
-        options,
-        correct_answer,
-        marks,
-        student_answers!left (
-          answer,
-          is_correct
-        )
-      `)
-      .eq('exam_id', examId)
-      .eq('student_answers.student_id', studentId)
-      .order('id');
+    const questions = await Question.find({ exam_id: examId }).sort({ _id: 1 }).lean();
+    const questionIds = questions.map(q => q._id);
 
-    if (answersError) throw answersError;
+    const studentAnswers = await StudentAnswer.find({ 
+      student_id: studentId, 
+      question_id: { $in: questionIds } 
+    }).lean();
 
-    const formattedAnswers = answers.map((row) => {
-      const sa = row.student_answers?.[0] || {};
+    const studentAnswerMap = new Map();
+    studentAnswers.forEach(sa => {
+      studentAnswerMap.set(String(sa.question_id), sa);
+    });
+
+    const formattedAnswers = questions.map((row) => {
+      const sa = studentAnswerMap.get(String(row._id)) || {};
       return {
-        questionId: row.id,
+        questionId: row._id,
         questionText: row.question_text,
         type: row.type,
         options: row.type === 'TF' ? ['True', 'False'] : safeParseOptions(row.options, []),
@@ -151,10 +122,12 @@ router.get('/:studentId/:examId', authenticateToken, async (req, res) => {
         ? exam.total_marks
         : formattedAnswers.reduce((sum, row) => sum + (row.marks || 0), 0);
 
+    const percentage = totalMarks > 0 ? (result.score / totalMarks) * 100 : 0;
+
     res.json({
       success: true,
       exam: {
-        id: exam.id,
+        id: exam._id,
         title: exam.title,
         description: exam.description,
         total_marks: totalMarks,
@@ -164,12 +137,9 @@ router.get('/:studentId/:examId', authenticateToken, async (req, res) => {
         exam_id: examId,
         score: result.score,
         total_marks: totalMarks,
-        percentage: Math.round(totalMarks > 0 ? (result.score / totalMarks) * 100 : 0),
-        grade: (() => {
-          const p = totalMarks > 0 ? (result.score / totalMarks) * 100 : 0;
-          return getGrade(p);
-        })(),
-        submitted_at: result.submitted_at,
+        percentage: Math.round(percentage),
+        grade: getGrade(percentage),
+        submitted_at: result.submitted_at || result.createdAt,
       },
       answers: formattedAnswers,
     });
@@ -180,4 +150,3 @@ router.get('/:studentId/:examId', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
-

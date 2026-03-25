@@ -1,12 +1,13 @@
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../config/database');
+const Student = require('../models/Student');
+const Assignment = require('../models/Assignment');
+const Submission = require('../models/Submission');
 const { authenticateToken } = require('../middleware/auth');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 
-// Configure multer for assignment submissions
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         const uploadDir = 'uploads/assignments/submissions';
@@ -23,7 +24,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
     storage: storage,
-    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+    limits: { fileSize: 10 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
         cb(null, true);
     }
@@ -38,43 +39,32 @@ router.get('/', authenticateToken, async (req, res) => {
 
         const studentId = req.user.id;
 
-        // Get student's trade and level to filter assignments
-        const { data: student, error: studentError } = await supabase
-            .from('students')
-            .select('trade, level')
-            .eq('id', studentId)
-            .single();
-
-        if (studentError) {
-            if (studentError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Student not found' });
-            throw studentError;
+        const student = await Student.findById(studentId).select('trade level').lean();
+        if (!student) {
+            return res.status(404).json({ success: false, message: 'Student not found' });
         }
 
         const { trade, level } = student;
 
-        // Get assignments for this trade/level, including submission status
-        // Using inner join on teachers and left join on submissions
-        const { data: assignments, error: aError } = await supabase
-            .from('assignments')
-            .select('*, submissions:student_assignment_submissions!left(*), teacher:teachers(full_name)')
-            .eq('trade', trade)
-            .eq('level', level)
-            .order('deadline', { ascending: true });
+        const assignments = await Assignment.find({ trade, level })
+            .populate('teacher_id', 'full_name')
+            .sort({ deadline: 1 })
+            .lean();
 
-        if (aError) throw aError;
+        const assignmentIds = assignments.map(a => a._id);
+        const submissions = await Submission.find({ student_id: studentId, assignment_id: { $in: assignmentIds } }).lean();
 
-        // Filter submissions for current student and format
         const formatted = assignments.map(a => {
-            const studentSumission = (a.submissions || []).find(s => s.student_id === studentId);
+            const studentSubmission = submissions.find(s => s.assignment_id.toString() === a._id.toString());
             return {
+                id: a._id,
                 ...a,
-                submission_id: studentSumission?.id || null,
-                submitted_at: studentSumission?.submitted_at || null,
-                grade: studentSumission?.grade || null,
-                feedback: studentSumission?.feedback || null,
-                teacher_name: a.teacher?.full_name,
-                submissions: undefined,
-                teacher: undefined
+                submission_id: studentSubmission?._id || null,
+                submitted_at: studentSubmission?.submitted_at || null,
+                grade: studentSubmission?.grade || null,
+                feedback: studentSubmission?.feedback || null,
+                teacher_name: a.teacher_id?.full_name,
+                teacher_id: undefined
             };
         });
 
@@ -103,23 +93,16 @@ router.post('/:id/submit', authenticateToken, upload.single('file'), async (req,
         const studentId = req.user.id;
         const filePath = `/uploads/assignments/submissions/${req.file.filename}`;
 
-        const { data, error } = await supabase
-            .from('student_assignment_submissions')
-            .upsert({
-                assignment_id: assignmentId,
-                student_id: studentId,
-                submission_path: filePath,
-                submitted_at: new Date().toISOString()
-            }, { onConflict: 'assignment_id,student_id' })
-            .select()
-            .single();
-
-        if (error) throw error;
+        const data = await Submission.findOneAndUpdate(
+            { assignment_id: assignmentId, student_id: studentId },
+            { file_path: filePath, submitted_at: new Date() },
+            { upsert: true, new: true }
+        );
 
         res.json({
             success: true,
             message: 'Assignment submitted successfully',
-            filePath: data.submission_path
+            filePath: data.file_path
         });
 
     } catch (error) {
@@ -138,33 +121,21 @@ router.get('/:id', authenticateToken, async (req, res) => {
         const assignmentId = req.params.id;
         const studentId = req.user.id;
 
-        const { data: assignment, error: aError } = await supabase
-            .from('assignments')
-            .select('*, teacher:teachers(full_name)')
-            .eq('id', assignmentId)
-            .single();
-
-        if (aError) {
-            if (aError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Assignment not found' });
-            throw aError;
+        const assignment = await Assignment.findById(assignmentId).populate('teacher_id', 'full_name').lean();
+        
+        if (!assignment) {
+            return res.status(404).json({ success: false, message: 'Assignment not found' });
         }
 
-        // Check submission
-        const { data: submission, error: sError } = await supabase
-            .from('student_assignment_submissions')
-            .select('*')
-            .eq('assignment_id', assignmentId)
-            .eq('student_id', studentId)
-            .maybeSingle();
-
-        if (sError) throw sError;
+        const submission = await Submission.findOne({ assignment_id: assignmentId, student_id: studentId }).lean();
 
         res.json({
             success: true,
             assignment: {
+                id: assignment._id,
                 ...assignment,
-                teacher_name: assignment.teacher?.full_name,
-                teacher: undefined
+                teacher_name: assignment.teacher_id?.full_name,
+                teacher_id: undefined
             },
             submission: submission || null
         });

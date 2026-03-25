@@ -1,26 +1,28 @@
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../config/database');
+const Testimonial = require('../models/Testimonial');
 const { authenticateToken } = require('../middleware/auth');
 
-// Get all approved testimonials (public)
 router.get('/approved', async (req, res) => {
   try {
-    const { data: testimonials, error } = await supabase
-      .from('testimonials')
-      .select('id, full_name, program, graduation_year, rating, testimonial_text, profile_image, created_at')
-      .eq('status', 'approved')
-      .order('created_at', { ascending: false });
+    const testimonials = await Testimonial.find({ status: 'approved' })
+      .select('_id full_name program graduation_year rating testimonial_text profile_image createdAt')
+      .sort({ createdAt: -1 })
+      .lean();
 
-    if (error) throw error;
-    res.json(testimonials);
+    const formatted = testimonials.map(t => ({
+      id: t._id,
+      ...t,
+      created_at: t.createdAt
+    }));
+
+    res.json(formatted);
   } catch (error) {
     console.error('Error fetching approved testimonials:', error);
     res.status(500).json({ error: 'Failed to fetch testimonials' });
   }
 });
 
-// Submit a new testimonial (public)
 router.post('/submit', async (req, res) => {
   try {
     const {
@@ -34,7 +36,6 @@ router.post('/submit', async (req, res) => {
       profile_image
     } = req.body;
 
-    // Validation
     if (!full_name || !email || !program || !rating || !testimonial_text) {
       return res.status(400).json({
         error: 'Please provide all required fields: full_name, email, program, rating, and testimonial_text'
@@ -45,28 +46,21 @@ router.post('/submit', async (req, res) => {
       return res.status(400).json({ error: 'Rating must be between 1 and 5' });
     }
 
-    // Insert testimonial
-    const { data: result, error } = await supabase
-      .from('testimonials')
-      .insert([{
-        full_name,
-        email,
-        phone_number,
-        program,
-        graduation_year,
-        rating,
-        testimonial_text,
-        profile_image,
-        status: 'pending'
-      }])
-      .select()
-      .single();
-
-    if (error) throw error;
+    const test = await Testimonial.create({
+      full_name,
+      email,
+      phone_number,
+      program,
+      graduation_year,
+      rating,
+      testimonial_text,
+      profile_image,
+      status: 'pending'
+    });
 
     res.status(201).json({
       message: 'Testimonial submitted successfully! It will be reviewed by our admin team.',
-      testimonial_id: result.id
+      testimonial_id: test._id
     });
   } catch (error) {
     console.error('Error submitting testimonial:', error);
@@ -74,20 +68,19 @@ router.post('/submit', async (req, res) => {
   }
 });
 
-// Get all testimonials (admin only)
 router.get('/all', authenticateToken, async (req, res) => {
   try {
-    const { data: testimonials, error } = await supabase
-      .from('testimonials')
-      .select('*, approved_by:admins(full_name)')
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
+    const testimonials = await Testimonial.find()
+      .populate('approved_by', 'full_name')
+      .sort({ createdAt: -1 })
+      .lean();
 
     const formattedTestimonials = testimonials.map(t => ({
+      id: t._id,
       ...t,
       approved_by_name: t.approved_by?.full_name || null,
-      approved_by: t.approved_by ? undefined : null
+      approved_by: t.approved_by ? undefined : null,
+      created_at: t.createdAt
     }));
 
     res.json(formattedTestimonials);
@@ -97,7 +90,6 @@ router.get('/all', authenticateToken, async (req, res) => {
   }
 });
 
-// Get testimonials by status (admin only)
 router.get('/status/:status', authenticateToken, async (req, res) => {
   try {
     const { status } = req.params;
@@ -106,18 +98,17 @@ router.get('/status/:status', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
-    const { data: testimonials, error } = await supabase
-      .from('testimonials')
-      .select('*, approved_by:admins(full_name)')
-      .eq('status', status)
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
+    const testimonials = await Testimonial.find({ status })
+      .populate('approved_by', 'full_name')
+      .sort({ createdAt: -1 })
+      .lean();
 
     const formattedTestimonials = testimonials.map(t => ({
+      id: t._id,
       ...t,
       approved_by_name: t.approved_by?.full_name || null,
-      approved_by: t.approved_by ? undefined : null
+      approved_by: t.approved_by ? undefined : null,
+      created_at: t.createdAt
     }));
 
     res.json(formattedTestimonials);
@@ -127,26 +118,22 @@ router.get('/status/:status', authenticateToken, async (req, res) => {
   }
 });
 
-// Get single testimonial (admin only)
 router.get('/:id', authenticateToken, async (req, res) => {
   try {
-    const { data: testimonial, error } = await supabase
-      .from('testimonials')
-      .select('*, approved_by:admins(full_name)')
-      .eq('id', req.params.id)
-      .single();
+    const testimonial = await Testimonial.findById(req.params.id)
+      .populate('approved_by', 'full_name')
+      .lean();
 
-    if (error) {
-      if (error.code === 'PGRST116') {
-        return res.status(404).json({ error: 'Testimonial not found' });
-      }
-      throw error;
+    if (!testimonial) {
+      return res.status(404).json({ error: 'Testimonial not found' });
     }
 
     const formattedTestimonial = {
+      id: testimonial._id,
       ...testimonial,
       approved_by_name: testimonial.approved_by?.full_name || null,
-      approved_by: testimonial.approved_by ? undefined : null
+      approved_by: testimonial.approved_by ? undefined : null,
+      created_at: testimonial.createdAt
     };
 
     res.json(formattedTestimonial);
@@ -156,24 +143,22 @@ router.get('/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Approve testimonial (admin only)
 router.put('/:id/approve', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { admin_notes } = req.body;
     const adminId = req.user.id;
 
-    const { error, count } = await supabase
-      .from('testimonials')
-      .update({
-        status: 'approved',
-        approved_by: adminId,
-        approved_at: new Date().toISOString(),
-        admin_notes: admin_notes || null
-      })
-      .eq('id', id);
+    const testimonial = await Testimonial.findByIdAndUpdate(id, {
+      status: 'approved',
+      approved_by: adminId,
+      approved_at: new Date(),
+      admin_notes: admin_notes || null
+    });
 
-    if (error) throw error;
+    if (!testimonial) {
+      return res.status(404).json({ error: 'Testimonial not found' });
+    }
 
     res.json({ message: 'Testimonial approved successfully' });
   } catch (error) {
@@ -182,24 +167,22 @@ router.put('/:id/approve', authenticateToken, async (req, res) => {
   }
 });
 
-// Reject testimonial (admin only)
 router.put('/:id/reject', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { admin_notes } = req.body;
     const adminId = req.user.id;
 
-    const { error } = await supabase
-      .from('testimonials')
-      .update({
-        status: 'rejected',
-        approved_by: adminId,
-        approved_at: new Date().toISOString(),
-        admin_notes: admin_notes || null
-      })
-      .eq('id', id);
+    const testimonial = await Testimonial.findByIdAndUpdate(id, {
+      status: 'rejected',
+      approved_by: adminId,
+      approved_at: new Date(),
+      admin_notes: admin_notes || null
+    });
 
-    if (error) throw error;
+    if (!testimonial) {
+      return res.status(404).json({ error: 'Testimonial not found' });
+    }
 
     res.json({ message: 'Testimonial rejected' });
   } catch (error) {
@@ -208,16 +191,11 @@ router.put('/:id/reject', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete testimonial (admin only)
 router.delete('/:id', authenticateToken, async (req, res) => {
   try {
-    const { error, count } = await supabase
-      .from('testimonials')
-      .delete({ count: 'exact' })
-      .eq('id', req.params.id);
+    const deletedTestimonial = await Testimonial.findByIdAndDelete(req.params.id);
 
-    if (error) throw error;
-    if (count === 0) {
+    if (!deletedTestimonial) {
       return res.status(404).json({ error: 'Testimonial not found' });
     }
 
@@ -228,14 +206,9 @@ router.delete('/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Get testimonial statistics (admin only)
 router.get('/stats/overview', authenticateToken, async (req, res) => {
   try {
-    const { data: testimonials, error } = await supabase
-      .from('testimonials')
-      .select('status, rating');
-
-    if (error) throw error;
+    const testimonials = await Testimonial.find().select('status rating').lean();
 
     const approvedTestimonials = testimonials.filter(t => t.status === 'approved');
     const totalRating = approvedTestimonials.reduce((sum, t) => sum + t.rating, 0);

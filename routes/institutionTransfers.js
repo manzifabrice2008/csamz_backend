@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const { supabase } = require('../config/database');
+const Transfer = require('../models/Transfer');
+const Student = require('../models/Student');
 const { authenticateToken } = require('../middleware/auth');
 const { uploadDocument } = require('./upload');
 
@@ -16,7 +17,6 @@ router.post('/request',
   ],
   async (req, res) => {
     try {
-      // Check if user is a student
       if (req.user.role !== 'student') {
         return res.status(403).json({
           success: false,
@@ -24,7 +24,6 @@ router.post('/request',
         });
       }
 
-      // Validate request
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({
@@ -33,7 +32,6 @@ router.post('/request',
         });
       }
 
-      // Check if document was uploaded
       if (!req.file) {
         return res.status(400).json({
           success: false,
@@ -44,25 +42,18 @@ router.post('/request',
       const { currentInstitution, targetInstitution, reason } = req.body;
       const documentPath = `/uploads/${req.file.filename}`;
 
-      // Save to database
-      const { data, error } = await supabase
-        .from('institution_transfers')
-        .insert([{
-          student_id: req.user.id,
-          current_institution: currentInstitution,
-          target_institution: targetInstitution,
-          reason,
-          witness_document_path: documentPath
-        }])
-        .select()
-        .single();
-
-      if (error) throw error;
+      const transfer = await Transfer.create({
+        student_id: req.user.id,
+        current_institution: currentInstitution,
+        target_institution: targetInstitution,
+        reason,
+        witness_document_path: documentPath
+      });
 
       res.status(201).json({
         success: true,
         message: 'Transfer request submitted successfully',
-        transferId: data.id
+        transferId: transfer._id
       });
     } catch (error) {
       console.error('Transfer request error:', error);
@@ -77,7 +68,6 @@ router.post('/request',
 // Get all transfer requests (admin only)
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    // Check if user is admin
     if (req.user.role !== 'admin' && req.user.role !== 'super_admin') {
       return res.status(403).json({
         success: false,
@@ -85,18 +75,18 @@ router.get('/', authenticateToken, async (req, res) => {
       });
     }
 
-    const { data: transfers, error } = await supabase
-      .from('institution_transfers')
-      .select('*, student:students(full_name, trade)')
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
+    const transfers = await Transfer.find()
+      .populate('student_id', 'full_name trade')
+      .sort({ createdAt: -1 })
+      .lean();
 
     const formattedTransfers = transfers.map(it => ({
+      id: it._id,
       ...it,
-      student_name: it.student?.full_name,
-      student_trade: it.student?.trade,
-      document_url: `/api/upload/witness-document/${it.witness_document_path.split('/').pop()}`
+      student_name: it.student_id?.full_name,
+      student_trade: it.student_id?.trade,
+      document_url: `/api/upload/witness-document/${it.witness_document_path.split('/').pop()}`,
+      created_at: it.createdAt
     }));
 
     res.json({
@@ -122,7 +112,6 @@ router.patch('/:id/status',
   ],
   async (req, res) => {
     try {
-      // Check if user is admin
       if (req.user.role !== 'admin' && req.user.role !== 'super_admin') {
         return res.status(403).json({
           success: false,
@@ -141,30 +130,21 @@ router.patch('/:id/status',
       const { status, adminNotes } = req.body;
       const transferId = req.params.id;
 
-      // Update transfer status
-      const { data: transfer, error: updateError } = await supabase
-        .from('institution_transfers')
-        .update({
-          status,
-          admin_notes: adminNotes || null,
-          processed_by: req.user.id,
-          processed_at: new Date().toISOString()
-        })
-        .eq('id', transferId)
-        .select()
-        .single();
+      const transfer = await Transfer.findByIdAndUpdate(transferId, {
+        status,
+        admin_notes: adminNotes || null,
+        processed_by: req.user.id,
+        processed_at: new Date()
+      }, { new: true }).lean();
 
-      if (updateError) throw updateError;
+      if (!transfer) {
+        return res.status(404).json({ success: false, message: 'Transfer request not found' });
+      }
 
-      // If approved, update student's institution
       if (status === 'approved') {
-        // Update student's institution
-        const { error: studentUpdateError } = await supabase
-          .from('students')
-          .update({ institution: transfer.target_institution })
-          .eq('id', transfer.student_id);
-
-        if (studentUpdateError) throw studentUpdateError;
+        await Student.findByIdAndUpdate(transfer.student_id, {
+          institution: transfer.target_institution
+        });
       }
 
       res.json({
@@ -191,17 +171,15 @@ router.get('/my-requests', authenticateToken, async (req, res) => {
       });
     }
 
-    const { data: transfers, error } = await supabase
-      .from('institution_transfers')
-      .select('*')
-      .eq('student_id', req.user.id)
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
+    const transfers = await Transfer.find({ student_id: req.user.id })
+      .sort({ createdAt: -1 })
+      .lean();
 
     const formattedTransfers = transfers.map(it => ({
+      id: it._id,
       ...it,
-      document_url: `/api/upload/witness-document/${it.witness_document_path.split('/').pop()}`
+      document_url: `/api/upload/witness-document/${it.witness_document_path.split('/').pop()}`,
+      created_at: it.createdAt
     }));
 
     res.json({

@@ -3,7 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const { supabase } = require('../config/database');
+const Student = require('../models/Student');
 const { authenticateToken } = require('../middleware/auth');
 require('dotenv').config();
 
@@ -32,13 +32,10 @@ router.post('/register',
 
       const { username, password, full_name, email, phone_number, trade } = req.body;
 
-      const { data: existing, error: fetchError } = await supabase
-        .from('students')
-        .select('id')
-        .or(`username.eq.${username}${email ? `,email.eq.${email}` : ''}`)
-        .maybeSingle();
+      const orQuery = [{ username }];
+      if (email) orQuery.push({ email });
 
-      if (fetchError) throw fetchError;
+      const existing = await Student.findOne({ $or: orQuery });
 
       if (existing) {
         return res.status(400).json({ success: false, message: 'Username or email already in use' });
@@ -47,23 +44,17 @@ router.post('/register',
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
 
-      const { data: result, error: insertError } = await supabase
-        .from('students')
-        .insert([{
-          username,
-          password: hashedPassword,
-          full_name,
-          email: email || null,
-          phone_number,
-          trade
-        }])
-        .select()
-        .single();
-
-      if (insertError) throw insertError;
+      const result = await Student.create({
+        username,
+        password: hashedPassword,
+        full_name,
+        email: email || undefined,
+        phone_number,
+        trade
+      });
 
       const token = jwt.sign(
-        { id: result.id, role: 'student', username, full_name, trade },
+        { id: result._id, role: 'student', username, full_name, trade },
         process.env.JWT_SECRET,
         { expiresIn: STUDENT_JWT_EXPIRY }
       );
@@ -73,10 +64,10 @@ router.post('/register',
         message: 'Student registered successfully',
         token,
         student: {
-          id: result.id,
+          id: result._id,
           username,
           full_name,
-          email: email || null,
+          email: result.email || null,
           phone_number,
           trade,
           role: 'student',
@@ -102,13 +93,7 @@ router.post('/login',
       }
 
       const { username, password } = req.body;
-      const { data: student, error: fetchError } = await supabase
-        .from('students')
-        .select('id, username, password, full_name, email, status, trade')
-        .eq('username', username)
-        .maybeSingle();
-
-      if (fetchError) throw fetchError;
+      const student = await Student.findOne({ username });
 
       if (!student) {
         return res.status(401).json({ success: false, message: 'Invalid credentials' });
@@ -124,7 +109,7 @@ router.post('/login',
       }
 
       const token = jwt.sign(
-        { id: student.id, role: 'student', username: student.username, trade: student.trade },
+        { id: student._id, role: 'student', username: student.username, trade: student.trade },
         process.env.JWT_SECRET,
         { expiresIn: STUDENT_JWT_EXPIRY }
       );
@@ -134,7 +119,7 @@ router.post('/login',
         message: 'Login successful',
         token,
         student: {
-          id: student.id,
+          id: student._id,
           username: student.username,
           full_name: student.full_name,
           email: student.email,
@@ -155,19 +140,23 @@ router.get('/me', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    const { data: student, error } = await supabase
-      .from('students')
-      .select('id, username, full_name, email, status, trade')
-      .eq('id', req.user.id)
-      .maybeSingle();
-
-    if (error) throw error;
+    const student = await Student.findById(req.user.id).select('_id username full_name email status trade');
 
     if (!student) {
       return res.status(404).json({ success: false, message: 'Student not found' });
     }
 
-    res.json({ success: true, student });
+    res.json({ 
+      success: true, 
+      student: {
+        id: student._id,
+        username: student.username,
+        full_name: student.full_name,
+        email: student.email,
+        status: student.status,
+        trade: student.trade
+      }
+    });
   } catch (error) {
     console.error('Student me error:', error);
     res.status(500).json({ success: false, message: 'Server error' });

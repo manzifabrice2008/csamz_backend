@@ -3,11 +3,12 @@ const router = express.Router();
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { supabase } = require('../config/database');
+const Teacher = require('../models/Teacher');
+const Assignment = require('../models/Assignment');
+const Submission = require('../models/Submission');
 const { authenticateToken } = require('../middleware/auth');
 const { body, validationResult } = require('express-validator');
 
-// Configuration for Multer (File Uploads) - Local storage for now as original
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         const uploadDir = 'uploads/assignments/materials';
@@ -24,7 +25,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
     storage: storage,
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+    limits: { fileSize: 10 * 1024 * 1024 }
 });
 
 const ensureTeacher = (req, res, next) => {
@@ -34,23 +35,26 @@ const ensureTeacher = (req, res, next) => {
     next();
 };
 
-// GET / - List assignments created by the teacher
 router.get('/', authenticateToken, ensureTeacher, async (req, res) => {
     try {
         const teacherId = req.user.id;
 
-        const { data: assignments, error } = await supabase
-            .from('assignments')
-            .select('*, submissions:student_assignment_submissions(id)')
-            .eq('teacher_id', teacherId)
-            .order('created_at', { ascending: false });
+        const assignments = await Assignment.find({ teacher_id: teacherId })
+            .sort({ createdAt: -1 })
+            .lean();
 
-        if (error) throw error;
+        const assignmentIds = assignments.map(a => a._id);
+        const submissions = await Submission.find({ assignment_id: { $in: assignmentIds } }).lean();
 
-        const formatted = assignments.map(a => ({
-            ...a,
-            submission_count: a.submissions?.length || 0
-        }));
+        const formatted = assignments.map(a => {
+            const assignmentSubmissions = submissions.filter(s => s.assignment_id.toString() === a._id.toString());
+            return {
+                id: a._id,
+                ...a,
+                created_at: a.createdAt,
+                submission_count: assignmentSubmissions.length
+            };
+        });
 
         res.json({ success: true, assignments: formatted });
     } catch (error) {
@@ -59,7 +63,6 @@ router.get('/', authenticateToken, ensureTeacher, async (req, res) => {
     }
 });
 
-// POST / - Create new assignment
 router.post('/', authenticateToken, ensureTeacher, upload.single('file'), [
     body('title').trim().notEmpty().withMessage('Title is required'),
     body('description').trim().notEmpty().withMessage('Description is required'),
@@ -76,35 +79,23 @@ router.post('/', authenticateToken, ensureTeacher, upload.single('file'), [
         const { title, description, deadline, level } = req.body;
         const filePath = req.file ? req.file.path : null;
 
-        // Get teacher trade
-        const { data: teacher, error: tError } = await supabase
-            .from('teachers')
-            .select('trade')
-            .eq('id', teacherId)
-            .single();
+        const teacher = await Teacher.findById(teacherId).select('trade').lean();
+        if (!teacher) throw new Error('Teacher not found');
 
-        if (tError) throw tError;
-
-        const { data: result, error: insertError } = await supabase
-            .from('assignments')
-            .insert([{
-                title,
-                description,
-                trade: teacher.trade,
-                level: level || 'L1',
-                deadline,
-                teacher_id: teacherId,
-                file_path: filePath
-            }])
-            .select()
-            .single();
-
-        if (insertError) throw insertError;
+        const result = await Assignment.create({
+            title,
+            description,
+            trade: teacher.trade,
+            level: level || 'L1',
+            deadline,
+            teacher_id: teacherId,
+            file_path: filePath
+        });
 
         res.status(201).json({
             success: true,
             message: 'Assignment created successfully',
-            assignmentId: result.id
+            assignmentId: result._id
         });
 
     } catch (error) {
@@ -113,38 +104,29 @@ router.post('/', authenticateToken, ensureTeacher, upload.single('file'), [
     }
 });
 
-// GET /:id/submissions - Get all submissions for a specific assignment
 router.get('/:id/submissions', authenticateToken, ensureTeacher, async (req, res) => {
     try {
         const assignmentId = req.params.id;
         const teacherId = req.user.id;
 
-        // Verify assignment belongs to teacher
-        const { data: assign, error: vError } = await supabase
-            .from('assignments')
-            .select('id')
-            .eq('id', assignmentId)
-            .eq('teacher_id', teacherId)
-            .maybeSingle();
+        const assign = await Assignment.findOne({ _id: assignmentId, teacher_id: teacherId }).select('_id').lean();
 
-        if (vError) throw vError;
         if (!assign) {
             return res.status(404).json({ success: false, message: 'Assignment not found or access denied' });
         }
 
-        const { data: submissions, error: sError } = await supabase
-            .from('student_assignment_submissions')
-            .select('*, student:students(full_name, email, level)')
-            .eq('assignment_id', assignmentId)
-            .order('submitted_at', { ascending: false });
-
-        if (sError) throw sError;
+        const submissions = await Submission.find({ assignment_id: assignmentId })
+            .populate('student_id', 'full_name email level')
+            .sort({ submitted_at: -1 })
+            .lean();
 
         const formattedSubmissions = submissions.map(s => ({
+            id: s._id,
             ...s,
-            full_name: s.student?.full_name,
-            email: s.student?.email,
-            level: s.student?.level
+            full_name: s.student_id?.full_name,
+            email: s.student_id?.email,
+            level: s.student_id?.level,
+            student_id: undefined
         }));
 
         res.json({ success: true, submissions: formattedSubmissions });
@@ -155,7 +137,6 @@ router.get('/:id/submissions', authenticateToken, ensureTeacher, async (req, res
     }
 });
 
-// POST /submissions/:id/grade - Grade a submission
 router.post('/submissions/:id/grade', authenticateToken, ensureTeacher, [
     body('grade').isInt({ min: 0, max: 100 }).withMessage('Grade must be between 0 and 100'),
     body('feedback').optional().trim().isString()
@@ -165,32 +146,21 @@ router.post('/submissions/:id/grade', authenticateToken, ensureTeacher, [
         const teacherId = req.user.id;
         const { grade, feedback } = req.body;
 
-        // Verify submission belongs to an assignment created by this teacher
-        const { data: sub, error: vError } = await supabase
-            .from('student_assignment_submissions')
-            .select('id, assignment:assignments(teacher_id)')
-            .eq('id', submissionId)
-            .single();
+        const sub = await Submission.findById(submissionId).populate('assignment_id', 'teacher_id').lean();
 
-        if (vError) {
-            if (vError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Submission not found' });
-            throw vError;
+        if (!sub) {
+            return res.status(404).json({ success: false, message: 'Submission not found' });
         }
 
-        if (sub.assignment?.teacher_id !== teacherId) {
+        if (sub.assignment_id?.teacher_id.toString() !== teacherId.toString()) {
             return res.status(403).json({ success: false, message: 'Access denied' });
         }
 
-        const { error: updateError } = await supabase
-            .from('student_assignment_submissions')
-            .update({
-                grade,
-                feedback: feedback || null,
-                graded_at: new Date().toISOString()
-            })
-            .eq('id', submissionId);
-
-        if (updateError) throw updateError;
+        await Submission.findByIdAndUpdate(submissionId, {
+            grade,
+            feedback: feedback || null,
+            graded_at: new Date()
+        });
 
         res.json({ success: true, message: 'Submission graded successfully' });
 

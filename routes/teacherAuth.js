@@ -3,7 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const { supabase } = require('../config/database');
+const Teacher = require('../models/Teacher');
 const { authenticateToken } = require('../middleware/auth');
 const { sendTeacherStatusUpdate } = require('../services/email');
 require('dotenv').config();
@@ -33,13 +33,7 @@ router.post(
 
       const { full_name, username, email, password, trade } = req.body;
 
-      const { data: existing, error: fetchError } = await supabase
-        .from('teachers')
-        .select('id')
-        .or(`username.eq.${username},email.eq.${email}`)
-        .maybeSingle();
-
-      if (fetchError) throw fetchError;
+      const existing = await Teacher.findOne({ $or: [{ username }, { email }] });
 
       if (existing) {
         return res.status(400).json({
@@ -51,19 +45,20 @@ router.post(
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
 
-      const { data: result, error: insertError } = await supabase
-        .from('teachers')
-        .insert([{ full_name, username, email, password: hashedPassword, trade, status: 'pending' }])
-        .select()
-        .single();
-
-      if (insertError) throw insertError;
+      const result = await Teacher.create({
+        full_name,
+        username,
+        email,
+        password: hashedPassword,
+        trade,
+        status: 'pending'
+      });
 
       res.status(201).json({
         success: true,
         message: 'Registration submitted. An admin must approve your account before you can log in.',
         teacher: {
-          id: result.id,
+          id: result._id,
           full_name,
           username,
           email,
@@ -93,13 +88,7 @@ router.post(
 
       const { email, password } = req.body;
 
-      const { data: teacher, error: fetchError } = await supabase
-        .from('teachers')
-        .select('id, full_name, username, email, password, status')
-        .eq('email', email)
-        .maybeSingle();
-
-      if (fetchError) throw fetchError;
+      const teacher = await Teacher.findOne({ email });
 
       if (!teacher) {
         return res.status(401).json({ success: false, message: 'Invalid credentials' });
@@ -122,7 +111,7 @@ router.post(
 
       const token = jwt.sign(
         {
-          id: teacher.id,
+          id: teacher._id,
           role: 'teacher',
           username: teacher.username,
           email: teacher.email,
@@ -137,7 +126,7 @@ router.post(
         message: 'Login successful',
         token,
         teacher: {
-          id: teacher.id,
+          id: teacher._id,
           full_name: teacher.full_name,
           username: teacher.username,
           email: teacher.email,
@@ -158,40 +147,47 @@ router.get('/me', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    const { data: teacher, error } = await supabase
-      .from('teachers')
-      .select('id, full_name, username, email, status, created_at')
-      .eq('id', req.user.id)
-      .maybeSingle();
-
-    if (error) throw error;
+    const teacher = await Teacher.findById(req.user.id).select('_id full_name username email status createdAt');
 
     if (!teacher) {
       return res.status(404).json({ success: false, message: 'Teacher not found' });
     }
 
-    res.json({ success: true, teacher });
+    res.json({ 
+      success: true, 
+      teacher: {
+        id: teacher._id,
+        full_name: teacher.full_name,
+        username: teacher.username,
+        email: teacher.email,
+        status: teacher.status,
+        created_at: teacher.createdAt
+      } 
+    });
   } catch (error) {
     console.error('Teacher me error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-// Admin-only endpoints to list and approve/reject teachers
 router.get('/admin/list', authenticateToken, async (req, res) => {
   try {
     if (!isAdminUser(req.user)) {
       return res.status(403).json({ success: false, message: 'Only admins can view teachers' });
     }
 
-    const { data: teachers, error } = await supabase
-      .from('teachers')
-      .select('id, full_name, username, email, status, created_at')
-      .order('created_at', { ascending: false });
+    const teachers = await Teacher.find().select('_id full_name username email status createdAt').sort({ createdAt: -1 });
 
-    if (error) throw error;
+    const formattedTeachers = teachers.map(t => ({
+      id: t._id,
+      full_name: t.full_name,
+      username: t.username,
+      email: t.email,
+      status: t.status,
+      created_at: t.createdAt
+    }));
 
-    res.json({ success: true, teachers });
+    res.json({ success: true, teachers: formattedTeachers });
   } catch (error) {
     console.error('List teachers error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
@@ -216,26 +212,15 @@ router.patch(
       const teacherId = req.params.id;
       const { status } = req.body;
 
-      const { error, count } = await supabase
-        .from('teachers')
-        .update({ status, updated_at: new Date().toISOString() })
-        .eq('id', teacherId);
+      const teacher = await Teacher.findByIdAndUpdate(teacherId, { status }, { new: true });
 
-      if (error) throw error;
-
-      // Fetch teacher details for email
-      const { data: teacher } = await supabase
-        .from('teachers')
-        .select('email, full_name, username')
-        .eq('id', teacherId)
-        .single();
-
-      if (teacher) {
-        // Send email notification (async, don't block response)
-        sendTeacherStatusUpdate(teacher, status).catch(err =>
-          console.error('Failed to send teacher status update email:', err)
-        );
+      if (!teacher) {
+        return res.status(404).json({ success: false, message: 'Teacher not found' });
       }
+
+      sendTeacherStatusUpdate(teacher, status).catch(err =>
+        console.error('Failed to send teacher status update email:', err)
+      );
 
       res.json({ success: true, message: `Teacher status updated to ${status}` });
     } catch (error) {
@@ -246,5 +231,3 @@ router.patch(
 );
 
 module.exports = router;
-
-

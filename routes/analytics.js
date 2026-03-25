@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../config/database');
+const SiteAnalytics = require('../models/SiteAnalytics');
 const { authenticateToken } = require('../middleware/auth');
 
 /**
@@ -13,22 +13,10 @@ router.post('/track', async (req, res) => {
         const { path } = req.body;
         if (!path) return res.status(400).json({ success: false, message: 'Path is required' });
 
-        // Insert visit record
-        const { error } = await supabase
-            .from('site_analytics')
-            .insert([{
-                page_path: path,
-                visited_at: new Date().toISOString()
-            }]);
-
-        if (error) {
-            // If table doesn't exist, log it but don't crash
-            if (error.code === '42P01') {
-                console.error('⚠️ site_analytics table not found in Supabase. Please run the SQL migration.');
-                return res.status(200).json({ success: true, warning: 'Table missing' });
-            }
-            throw error;
-        }
+        await SiteAnalytics.create({
+            page_path: path,
+            visited_at: new Date()
+        });
 
         res.json({ success: true });
     } catch (error) {
@@ -48,42 +36,27 @@ router.get('/overview', authenticateToken, async (req, res) => {
             return res.status(403).json({ success: false, message: 'Access denied' });
         }
 
-        // 1. Get Monthly Visitors (Current Month)
         const now = new Date();
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
-        const { count: monthlyCount, error: monthlyError } = await supabase
-            .from('site_analytics')
-            .select('*', { count: 'exact', head: true })
-            .gte('visited_at', startOfMonth.toISOString());
+        const monthlyCount = await SiteAnalytics.countDocuments({
+            visited_at: { $gte: startOfMonth }
+        });
 
-        if (monthlyError && monthlyError.code !== '42P01') throw monthlyError;
-
-        // 2. Get Last Month Visitors for Trend
         const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
         const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
 
-        const { count: lastMonthCount, error: altError } = await supabase
-            .from('site_analytics')
-            .select('*', { count: 'exact', head: true })
-            .gte('visited_at', startOfLastMonth.toISOString())
-            .lte('visited_at', endOfLastMonth.toISOString());
+        const lastMonthCount = await SiteAnalytics.countDocuments({
+            visited_at: { $gte: startOfLastMonth, $lte: endOfLastMonth }
+        });
 
-        if (altError && altError.code !== '42P01') throw altError;
+        const totalCount = await SiteAnalytics.countDocuments();
 
-        // 3. Get Total Visitors (All time)
-        const { count: totalCount, error: tError } = await supabase
-            .from('site_analytics')
-            .select('*', { count: 'exact', head: true });
-
-        if (tError && tError.code !== '42P01') throw tError;
-
-        // Calculate trend percentage
         let trend = 0;
         if (lastMonthCount > 0) {
             trend = Math.round(((monthlyCount - lastMonthCount) / lastMonthCount) * 100);
         } else if (monthlyCount > 0) {
-            trend = 100; // 100% up if starting from 0
+            trend = 100;
         }
 
         res.json({
@@ -93,7 +66,7 @@ router.get('/overview', authenticateToken, async (req, res) => {
                 last_month_visitors: lastMonthCount || 0,
                 total_visitors: totalCount || 0,
                 trend: trend,
-                is_table_missing: monthlyError?.code === '42P01'
+                is_table_missing: false
             }
         });
 

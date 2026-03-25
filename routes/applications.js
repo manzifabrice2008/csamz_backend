@@ -4,12 +4,11 @@ const { body, validationResult } = require('express-validator');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { supabase } = require('../config/database');
+const Application = require('../models/Application');
 const { authenticateToken: authMiddleware } = require('../middleware/auth');
 const smsService = require('../services/sms');
 const emailService = require('../services/email');
 
-// Configure multer for file uploads
 const uploadDir = path.join(__dirname, '../uploads/applications');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -25,7 +24,6 @@ const storage = multer.diskStorage({
   }
 });
 
-// Custom file filter
 const fileFilter = (req, file, cb) => {
   if (file.mimetype === 'application/pdf') {
     cb(null, true);
@@ -34,14 +32,12 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
-// Configure multer
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 20 * 1024 * 1024 }, // Increased to 20MB limit
+  limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: fileFilter
 }).single('report');
 
-// Custom middleware to handle multer errors
 const handleUpload = (req, res, next) => {
   upload(req, res, function (err) {
     if (err instanceof multer.MulterError) {
@@ -66,30 +62,25 @@ const handleUpload = (req, res, next) => {
   });
 };
 
-// Get all applications (protected - admin only)
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const { status, program } = req.query;
 
-    let query = supabase
-      .from('student_applications')
-      .select('*, approved_by:admins(username, full_name)');
+    const query = {};
+    if (status) query.status = status;
+    if (program) query.program = program;
 
-    if (status) query = query.eq('status', status);
-    if (program) query = query.eq('program', program);
+    const applications = await Application.find(query)
+      .sort({ createdAt: -1 })
+      .populate('approved_by', 'username full_name')
+      .lean();
 
-    query = query.order('created_at', { ascending: false });
-
-    const { data: applications, error } = await query;
-
-    if (error) throw error;
-
-    // Flatten join result for backward compatibility
     const formattedApps = applications.map(app => ({
+      id: app._id,
       ...app,
       approved_by_username: app.approved_by?.username || null,
       approved_by_name: app.approved_by?.full_name || null,
-      approved_by: app.approved_by ? undefined : null // Clean up if joined, or null
+      approved_by: app.approved_by ? undefined : null
     }));
 
     res.json({
@@ -106,26 +97,21 @@ router.get('/', authMiddleware, async (req, res) => {
   }
 });
 
-// Get single application by ID (protected)
 router.get('/:id', authMiddleware, async (req, res) => {
   try {
-    const { data: application, error } = await supabase
-      .from('student_applications')
-      .select('*, approved_by:admins(username, full_name)')
-      .eq('id', req.params.id)
-      .single();
+    const application = await Application.findById(req.params.id)
+      .populate('approved_by', 'username full_name')
+      .lean();
 
-    if (error) {
-      if (error.code === 'PGRST116') {
-        return res.status(404).json({
-          success: false,
-          message: 'Application not found'
-        });
-      }
-      throw error;
+    if (!application) {
+      return res.status(404).json({
+        success: false,
+        message: 'Application not found'
+      });
     }
 
     const formattedApp = {
+      id: application._id,
       ...application,
       approved_by_username: application.approved_by?.username || null,
       approved_by_name: application.approved_by?.full_name || null,
@@ -145,7 +131,6 @@ router.get('/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Middleware to parse application submissions
 const parseApplicationSubmission = (req, res, next) => {
   const contentType = req.headers['content-type'] || '';
 
@@ -165,7 +150,6 @@ const parseApplicationSubmission = (req, res, next) => {
   return handleUpload(req, res, next);
 };
 
-// Submit new application (public)
 router.post('/',
   parseApplicationSubmission,
   [
@@ -179,7 +163,6 @@ router.post('/',
   ],
   async (req, res) => {
     try {
-      // Validate request body
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({
@@ -205,28 +188,21 @@ router.post('/',
 
       const reportPath = req.file ? `/uploads/applications/${req.file.filename}` : null;
 
-      const { data: result, error } = await supabase
-        .from('student_applications')
-        .insert([{
-          full_name,
-          email,
-          phone_number,
-          date_of_birth,
-          gender,
-          address,
-          program,
-          previous_school: previous_school || null,
-          previous_qualification: previous_qualification || null,
-          guardian_name: guardian_name || null,
-          guardian_phone: guardian_phone || null,
-          report_path: reportPath
-        }])
-        .select()
-        .single();
+      const result = await Application.create({
+        full_name,
+        email,
+        phone_number,
+        date_of_birth,
+        gender,
+        address,
+        program,
+        previous_school: previous_school || null,
+        previous_qualification: previous_qualification || null,
+        guardian_name: guardian_name || null,
+        guardian_phone: guardian_phone || null,
+        report_path: reportPath
+      });
 
-      if (error) throw error;
-
-      // Send confirmation emails (async)
       const studentData = {
         full_name,
         email,
@@ -244,10 +220,10 @@ router.post('/',
       res.status(201).json({
         success: true,
         message: 'Application submitted successfully',
-        applicationId: result.id,
+        applicationId: result._id,
         hasReport: !!reportPath,
         application: {
-          id: result.id,
+          id: result._id,
           full_name,
           email,
           phone_number,
@@ -271,7 +247,6 @@ router.post('/',
   }
 );
 
-// Update application status (protected - admin only)
 router.patch('/:id/status',
   authMiddleware,
   [
@@ -292,44 +267,25 @@ router.patch('/:id/status',
       const applicationId = req.params.id;
       const adminId = req.user.id;
 
-      // Check existence and get data
-      const { data: application, error: fetchError } = await supabase
-        .from('student_applications')
-        .select('*')
-        .eq('id', applicationId)
-        .single();
+      const updatedApp = await Application.findByIdAndUpdate(applicationId, {
+        status,
+        admin_notes: admin_notes || null,
+        approved_by: adminId,
+        approved_at: new Date()
+      }, { new: true }).lean();
 
-      if (fetchError) {
-        if (fetchError.code === 'PGRST116') {
-          return res.status(404).json({
-            success: false,
-            message: 'Application not found'
-          });
-        }
-        throw fetchError;
+      if (!updatedApp) {
+        return res.status(404).json({
+          success: false,
+          message: 'Application not found'
+        });
       }
 
-      // Update application
-      const { data: updatedApp, error: updateError } = await supabase
-        .from('student_applications')
-        .update({
-          status,
-          admin_notes: admin_notes || null,
-          approved_by: adminId,
-          approved_at: new Date().toISOString()
-        })
-        .eq('id', applicationId)
-        .select()
-        .single();
-
-      if (updateError) throw updateError;
-
-      // Notifications
       const studentData = {
-        full_name: application.full_name,
-        email: application.email,
-        phone_number: application.phone_number,
-        program: application.program
+        full_name: updatedApp.full_name,
+        email: updatedApp.email,
+        phone_number: updatedApp.phone_number,
+        program: updatedApp.program
       };
 
       emailService.sendApplicationStatusUpdate(studentData, status, admin_notes).catch(err => console.error('Status update email failed:', err));
@@ -338,10 +294,10 @@ router.patch('/:id/status',
       if (status === 'approved' || status === 'rejected') {
         try {
           smsResult = await smsService.sendApplicationStatusSMS(
-            application.phone_number,
-            application.full_name,
+            updatedApp.phone_number,
+            updatedApp.full_name,
             status,
-            application.program,
+            updatedApp.program,
             admin_notes
           );
         } catch (smsError) {
@@ -352,7 +308,7 @@ router.patch('/:id/status',
       res.json({
         success: true,
         message: `Application ${status} successfully.`,
-        application: updatedApp,
+        application: { id: updatedApp._id, ...updatedApp },
         sms_sent: smsResult.success,
         sms_provider: smsResult.provider
       });
@@ -366,16 +322,11 @@ router.patch('/:id/status',
   }
 );
 
-// Delete application (protected - admin only)
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
-    const { error, count } = await supabase
-      .from('student_applications')
-      .delete({ count: 'exact' })
-      .eq('id', req.params.id);
+    const deletedApp = await Application.findByIdAndDelete(req.params.id);
 
-    if (error) throw error;
-    if (count === 0) {
+    if (!deletedApp) {
       return res.status(404).json({
         success: false,
         message: 'Application not found'
@@ -395,15 +346,9 @@ router.delete('/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Get application statistics (protected - admin only)
 router.get('/stats/overview', authMiddleware, async (req, res) => {
   try {
-    // We can use RPC or run multiple counts
-    const { data: applications, error } = await supabase
-      .from('student_applications')
-      .select('status, program');
-
-    if (error) throw error;
+    const applications = await Application.find().select('status program').lean();
 
     const stats = {
       total: applications.length,

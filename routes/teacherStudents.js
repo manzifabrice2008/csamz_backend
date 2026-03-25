@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../config/database');
+const Teacher = require('../models/Teacher');
+const Student = require('../models/Student');
 const { authenticateToken } = require('../middleware/auth');
 
 const ensureTeacher = (req, res, next) => {
@@ -15,34 +16,23 @@ router.get('/', authenticateToken, ensureTeacher, async (req, res) => {
     try {
         const teacherId = req.user.id;
 
-        // Get teacher's trade
-        const { data: teacher, error: teacherError } = await supabase
-            .from('teachers')
-            .select('trade')
-            .eq('id', teacherId)
-            .single();
-
-        if (teacherError) {
-            if (teacherError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Teacher profile error' });
-            throw teacherError;
+        const teacher = await Teacher.findById(teacherId).select('trade').lean();
+        if (!teacher) {
+            return res.status(404).json({ success: false, message: 'Teacher profile error' });
         }
 
         const trade = teacher.trade;
 
-        // Get students in that trade
-        // Excluding sensitive fields like password
-        const { data: students, error: studentError } = await supabase
-            .from('students')
-            .select('id, full_name, email, phone_number, trade, level, status, created_at')
-            .eq('trade', trade)
-            .order('full_name', { ascending: true });
+        const students = await Student.find({ trade })
+            .select('_id full_name email phone_number trade level status createdAt')
+            .sort({ full_name: 1 })
+            .lean();
 
-        if (studentError) throw studentError;
-
-        // Map phone_number to phone for consistency
         const formattedStudents = students.map(s => ({
+            id: s._id,
             ...s,
-            phone: s.phone_number
+            phone: s.phone_number,
+            created_at: s.createdAt
         }));
 
         res.json({
@@ -61,22 +51,21 @@ router.get('/:id', authenticateToken, ensureTeacher, async (req, res) => {
     try {
         const studentId = req.params.id;
 
-        const { data: student, error } = await supabase
-            .from('students')
-            .select('id, full_name, email, phone_number, trade, level, status, created_at')
-            .eq('id', studentId)
-            .single();
+        const student = await Student.findById(studentId)
+            .select('_id full_name email phone_number trade level status createdAt')
+            .lean();
 
-        if (error) {
-            if (error.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Student not found' });
-            throw error;
+        if (!student) {
+            return res.status(404).json({ success: false, message: 'Student not found' });
         }
 
         res.json({
             success: true,
             student: {
+                id: student._id,
                 ...student,
-                phone: student.phone_number
+                phone: student.phone_number,
+                created_at: student.createdAt
             }
         });
 

@@ -3,7 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const { supabase } = require('../config/database');
+const Admin = require('../models/Admin');
 require('dotenv').config();
 
 // Register new admin
@@ -28,14 +28,9 @@ router.post('/register',
       const { username, email, password, full_name, role = 'admin' } = req.body;
 
       // Check if user already exists
-      const { data: existingUsers, error: fetchError } = await supabase
-        .from('admins')
-        .select('*')
-        .or(`email.eq.${email},username.eq.${username}`);
+      const existingUser = await Admin.findOne({ $or: [{ email }, { username }] });
 
-      if (fetchError) throw fetchError;
-
-      if (existingUsers && existingUsers.length > 0) {
+      if (existingUser) {
         return res.status(400).json({
           success: false,
           message: 'User with this email or username already exists'
@@ -47,17 +42,17 @@ router.post('/register',
       const hashedPassword = await bcrypt.hash(password, salt);
 
       // Insert new admin
-      const { data: newUser, error: insertError } = await supabase
-        .from('admins')
-        .insert([{ username, email, password: hashedPassword, full_name, role }])
-        .select()
-        .single();
-
-      if (insertError) throw insertError;
+      const newUser = await Admin.create({
+        username,
+        email,
+        password: hashedPassword,
+        full_name,
+        role
+      });
 
       // Create JWT token
       const token = jwt.sign(
-        { id: newUser.id, username, email, role },
+        { id: newUser._id, username, email, role },
         process.env.JWT_SECRET,
         { expiresIn: '7d' }
       );
@@ -67,7 +62,7 @@ router.post('/register',
         message: 'Admin registered successfully',
         token,
         user: {
-          id: newUser.id,
+          id: newUser._id,
           username,
           email,
           full_name,
@@ -104,21 +99,14 @@ router.post('/login',
       const { email, password } = req.body;
 
       // Check if user exists
-      const { data: users, error: fetchError } = await supabase
-        .from('admins')
-        .select('*')
-        .eq('email', email);
+      const user = await Admin.findOne({ email });
 
-      if (fetchError) throw fetchError;
-
-      if (!users || users.length === 0) {
+      if (!user) {
         return res.status(401).json({
           success: false,
           message: 'Invalid credentials'
         });
       }
-
-      const user = users[0];
 
       // Verify password
       const isMatch = await bcrypt.compare(password, user.password);
@@ -132,7 +120,7 @@ router.post('/login',
 
       // Create JWT token
       const token = jwt.sign(
-        { id: user.id, username: user.username, email: user.email, role: user.role },
+        { id: user._id, username: user.username, email: user.email, role: user.role },
         process.env.JWT_SECRET,
         { expiresIn: '7d' }
       );
@@ -142,7 +130,7 @@ router.post('/login',
         message: 'Login successful',
         token,
         user: {
-          id: user.id,
+          id: user._id,
           username: user.username,
           email: user.email,
           full_name: user.full_name,
@@ -173,14 +161,9 @@ router.get('/me', async (req, res) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    const { data: users, error: fetchError } = await supabase
-      .from('admins')
-      .select('id, username, email, full_name, role, created_at')
-      .eq('id', decoded.id);
+    const user = await Admin.findById(decoded.id).select('_id username email full_name role createdAt');
 
-    if (fetchError) throw fetchError;
-
-    if (!users || users.length === 0) {
+    if (!user) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
@@ -189,7 +172,14 @@ router.get('/me', async (req, res) => {
 
     res.json({
       success: true,
-      user: users[0]
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        full_name: user.full_name,
+        role: user.role,
+        created_at: user.createdAt
+      }
     });
   } catch (error) {
     console.error('Get user error:', error);

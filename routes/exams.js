@@ -1,7 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const { supabase } = require('../config/database');
+const Exam = require('../models/Exam');
+const Question = require('../models/Question');
+const Result = require('../models/Result');
+const StudentAnswer = require('../models/StudentAnswer');
+const Teacher = require('../models/Teacher');
 const { authenticateToken } = require('../middleware/auth');
 
 const STAFF_ROLES = new Set(['admin', 'super_admin']);
@@ -41,7 +45,7 @@ const generateExamCode = () => {
 };
 
 const normalizeQuestion = (row, includeAnswer = true) => ({
-  id: row.id,
+  id: row._id,
   question_text: row.question_text,
   type: row.type,
   options: row.type === 'TF' ? ['True', 'False'] : safeParseOptions(row.options, []),
@@ -54,36 +58,41 @@ router.get('/', authenticateToken, async (req, res) => {
   try {
     const { teacherId } = req.query;
 
-    let query = supabase
-      .from('exams')
-      .select('*, questions(id)');
-
+    const query = {};
     if (teacherId) {
-      query = query.eq('teacher_id', teacherId);
+      query.teacher_id = teacherId;
     }
 
-    const { data: exams, error } = await query.order('created_at', { ascending: false });
+    const exams = await Exam.find(query).sort({ createdAt: -1 }).lean();
+    
+    // Get all questions to calculate question_count
+    const examIds = exams.map(e => e._id);
+    const questions = await Question.find({ exam_id: { $in: examIds } }).select('exam_id').lean();
+    
+    // Get all results if student to check already_taken
+    let studentResults = [];
+    if (req.user && req.user.role === 'student') {
+      studentResults = await Result.find({ student_id: req.user.id, exam_id: { $in: examIds } }).select('exam_id').lean();
+    }
+    const studentResultExamIds = new Set(studentResults.map(r => String(r.exam_id)));
 
-    if (error) throw error;
-
-    const formattedExams = await Promise.all(exams.map(async (e) => {
+    const formattedExams = exams.map((e) => {
+      const qCount = questions.filter(q => String(q.exam_id) === String(e._id)).length;
       let already_taken = false;
+
       if (req.user && req.user.role === 'student') {
-        const { data: result } = await supabase
-          .from('results')
-          .select('id')
-          .eq('student_id', req.user.id)
-          .eq('exam_id', e.id)
-          .maybeSingle();
-        if (result) already_taken = true;
+        already_taken = studentResultExamIds.has(String(e._id));
       }
 
       return {
+        id: e._id,
         ...e,
-        question_count: e.questions?.length || 0,
-        already_taken
+        question_count: qCount,
+        already_taken,
+        created_at: e.createdAt,
+        updated_at: e.updatedAt
       };
-    }));
+    });
 
     res.json({
       success: true,
@@ -120,15 +129,10 @@ router.post(
       const { title, description, total_marks = 0, exam_code, level, trade } = req.body;
       const teacherId = req.user.id;
 
-      // If user is a teacher, ensure they can only create exams for their own trade
       if (req.user?.role === 'teacher') {
-        const { data: teacher, error: teacherError } = await supabase
-          .from('teachers')
-          .select('trade')
-          .eq('id', teacherId)
-          .single();
-
-        if (teacherError) throw teacherError;
+        const teacher = await Teacher.findById(teacherId).select('trade').lean();
+        if (!teacher) throw new Error('Teacher not found');
+        
         if (teacher.trade !== trade) {
           return res.status(403).json({
             success: false,
@@ -140,13 +144,7 @@ router.post(
       let finalExamCode = exam_code?.toUpperCase() || null;
 
       if (finalExamCode) {
-        const { data: existing, error: checkError } = await supabase
-          .from('exams')
-          .select('id')
-          .eq('exam_code', finalExamCode)
-          .maybeSingle();
-
-        if (checkError) throw checkError;
+        const existing = await Exam.findOne({ exam_code: finalExamCode }).select('_id').lean();
         if (existing) {
           return res.status(400).json({ success: false, message: 'Exam code already in use' });
         }
@@ -154,27 +152,25 @@ router.post(
         let unique = false;
         while (!unique) {
           finalExamCode = generateExamCode();
-          const { data: existing } = await supabase
-            .from('exams')
-            .select('id')
-            .eq('exam_code', finalExamCode)
-            .maybeSingle();
+          const existing = await Exam.findOne({ exam_code: finalExamCode }).select('_id').lean();
           if (!existing) unique = true;
         }
       }
 
-      const { data: result, error: insertError } = await supabase
-        .from('exams')
-        .insert([{ title, exam_code: finalExamCode, description: description || null, total_marks, teacher_id: teacherId, trade, level }])
-        .select()
-        .single();
-
-      if (insertError) throw insertError;
+      const result = await Exam.create({
+        title,
+        exam_code: finalExamCode,
+        description: description || null,
+        total_marks,
+        teacher_id: teacherId,
+        trade,
+        level
+      });
 
       res.status(201).json({
         success: true,
         message: 'Exam created successfully',
-        exam: result,
+        exam: { id: result._id, ...result.toObject(), created_at: result.createdAt, updated_at: result.updatedAt },
       });
     } catch (error) {
       console.error('Create exam error:', error);
@@ -204,25 +200,17 @@ router.put(
       const examId = req.params.id;
       const { title, description, total_marks = 0, level, trade } = req.body;
 
-      // Check existence and ownership/permissions
-      const { data: existingExam, error: fetchError } = await supabase
-        .from('exams')
-        .select('*')
-        .eq('id', examId)
-        .single();
-
-      if (fetchError) {
-        if (fetchError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Exam not found' });
-        throw fetchError;
+      const existingExam = await Exam.findById(examId).lean();
+      if (!existingExam) {
+        return res.status(404).json({ success: false, message: 'Exam not found' });
       }
 
-      // If user is a teacher, ensure they can only update their own exams
       if (req.user?.role === 'teacher') {
-        if (existingExam.teacher_id !== req.user.id) {
+        if (String(existingExam.teacher_id) !== String(req.user.id)) {
           return res.status(403).json({ success: false, message: 'You can only update your own exams' });
         }
 
-        const { data: teacher } = await supabase.from('teachers').select('trade').eq('id', req.user.id).single();
+        const teacher = await Teacher.findById(req.user.id).select('trade').lean();
         if (teacher && teacher.trade !== trade) {
           return res.status(403).json({
             success: false,
@@ -231,26 +219,18 @@ router.put(
         }
       }
 
-      const { data: updated, error: updateError } = await supabase
-        .from('exams')
-        .update({
-          title,
-          description: description || null,
-          total_marks,
-          trade,
-          level,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', examId)
-        .select()
-        .single();
-
-      if (updateError) throw updateError;
+      const updated = await Exam.findByIdAndUpdate(examId, {
+        title,
+        description: description || null,
+        total_marks,
+        trade,
+        level
+      }, { new: true }).lean();
 
       res.json({
         success: true,
         message: 'Exam updated successfully',
-        exam: updated,
+        exam: { id: updated._id, ...updated, created_at: updated.createdAt, updated_at: updated.updatedAt },
       });
     } catch (error) {
       console.error('Update exam error:', error);
@@ -263,27 +243,16 @@ router.delete('/:id', authenticateToken, ensureStaff, async (req, res) => {
   try {
     const examId = req.params.id;
 
-    const { data: existing, error: fetchError } = await supabase
-      .from('exams')
-      .select('teacher_id')
-      .eq('id', examId)
-      .single();
-
-    if (fetchError) {
-      if (fetchError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Exam not found' });
-      throw fetchError;
+    const existing = await Exam.findById(examId).select('teacher_id').lean();
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Exam not found' });
     }
 
-    if (req.user?.role === 'teacher' && existing.teacher_id !== req.user.id) {
+    if (req.user?.role === 'teacher' && String(existing.teacher_id) !== String(req.user.id)) {
       return res.status(403).json({ success: false, message: 'You can only delete your own exams' });
     }
 
-    const { error: deleteError } = await supabase
-      .from('exams')
-      .delete()
-      .eq('id', examId);
-
-    if (deleteError) throw deleteError;
+    await Exam.findByIdAndDelete(examId);
 
     res.json({ success: true, message: 'Exam deleted successfully' });
   } catch (error) {
@@ -296,24 +265,12 @@ router.get('/:id/questions', async (req, res) => {
   try {
     const examId = req.params.id;
 
-    const { data: exam, error: examError } = await supabase
-      .from('exams')
-      .select('*')
-      .eq('id', examId)
-      .single();
-
-    if (examError) {
-      if (examError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Exam not found' });
-      throw examError;
+    const exam = await Exam.findById(examId).lean();
+    if (!exam) {
+      return res.status(404).json({ success: false, message: 'Exam not found' });
     }
 
-    const { data: questionRows, error: qError } = await supabase
-      .from('questions')
-      .select('id, question_text, type, options, correct_answer, marks')
-      .eq('exam_id', examId)
-      .order('id', { ascending: true });
-
-    if (qError) throw qError;
+    const questionRows = await Question.find({ exam_id: examId }).sort({ _id: 1 }).lean();
 
     const questions = questionRows.map((row) => normalizeQuestion(row, false));
     const totalMarks =
@@ -323,21 +280,19 @@ router.get('/:id/questions', async (req, res) => {
 
     let already_taken = false;
     if (req.user && req.user.role === 'student') {
-      const { data: result } = await supabase
-        .from('results')
-        .select('id')
-        .eq('student_id', req.user.id)
-        .eq('exam_id', examId)
-        .maybeSingle();
+      const result = await Result.findOne({ student_id: req.user.id, exam_id: examId }).select('_id').lean();
       if (result) already_taken = true;
     }
 
     res.json({
       success: true,
       exam: {
+        id: exam._id,
         ...exam,
         total_marks: totalMarks,
         already_taken,
+        created_at: exam.createdAt,
+        updated_at: exam.updatedAt
       },
       questions,
     });
@@ -351,30 +306,17 @@ router.get('/:id/manage', authenticateToken, ensureStaff, async (req, res) => {
   try {
     const examId = req.params.id;
 
-    const { data: exam, error: examError } = await supabase
-      .from('exams')
-      .select('*')
-      .eq('id', examId)
-      .single();
-
-    if (examError) {
-      if (examError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Exam not found' });
-      throw examError;
+    const exam = await Exam.findById(examId).lean();
+    if (!exam) {
+      return res.status(404).json({ success: false, message: 'Exam not found' });
     }
 
-    const { data: questionRows, error: qError } = await supabase
-      .from('questions')
-      .select('id, question_text, type, options, correct_answer, marks, time_limit')
-      .eq('exam_id', examId)
-      .order('id', { ascending: true });
-
-    if (qError) throw qError;
-
+    const questionRows = await Question.find({ exam_id: examId }).sort({ _id: 1 }).lean();
     const questions = questionRows.map((row) => normalizeQuestion(row, true));
 
     res.json({
       success: true,
-      exam,
+      exam: { id: exam._id, ...exam, created_at: exam.createdAt, updated_at: exam.updatedAt },
       questions,
     });
   } catch (error) {
@@ -411,26 +353,20 @@ router.post(
       const examId = req.params.id;
       const { question_text, type, options, correct_answer, marks, time_limit = 30 } = req.body;
 
-      const { data, error } = await supabase
-        .from('questions')
-        .insert([{
-          exam_id: examId,
-          question_text,
-          type,
-          options: type === 'MCQ' ? (typeof options === 'string' ? options : JSON.stringify(options)) : null,
-          correct_answer,
-          marks,
-          time_limit
-        }])
-        .select()
-        .single();
-
-      if (error) throw error;
+      const data = await Question.create({
+        exam_id: examId,
+        question_text,
+        type,
+        options: type === 'MCQ' ? (typeof options === 'string' ? options : JSON.stringify(options)) : null,
+        correct_answer,
+        marks,
+        time_limit
+      });
 
       res.status(201).json({
         success: true,
         message: 'Question added successfully',
-        question: normalizeQuestion(data, true),
+        question: normalizeQuestion(data.toObject(), true),
       });
     } catch (error) {
       console.error('Add question error:', error);
@@ -464,15 +400,9 @@ router.put(
 
       const questionId = req.params.questionId;
 
-      const { data: existing, error: fetchError } = await supabase
-        .from('questions')
-        .select('*')
-        .eq('id', questionId)
-        .single();
-
-      if (fetchError) {
-        if (fetchError.code === 'PGRST116') return res.status(404).json({ success: false, message: 'Question not found' });
-        throw fetchError;
+      const existing = await Question.findById(questionId).lean();
+      if (!existing) {
+        return res.status(404).json({ success: false, message: 'Question not found' });
       }
 
       const type = req.body.type || existing.type;
@@ -482,18 +412,10 @@ router.put(
         correct_answer: req.body.correct_answer || existing.correct_answer,
         marks: req.body.marks || existing.marks,
         time_limit: req.body.time_limit || existing.time_limit,
-        options: type === 'MCQ' ? (req.body.options ? JSON.stringify(req.body.options) : existing.options) : null,
-        updated_at: new Date().toISOString()
+        options: type === 'MCQ' ? (req.body.options ? JSON.stringify(req.body.options) : existing.options) : null
       };
 
-      const { data: updated, error: updateError } = await supabase
-        .from('questions')
-        .update(updatedData)
-        .eq('id', questionId)
-        .select()
-        .single();
-
-      if (updateError) throw updateError;
+      const updated = await Question.findByIdAndUpdate(questionId, updatedData, { new: true }).lean();
 
       res.json({
         success: true,
@@ -509,13 +431,8 @@ router.put(
 
 router.delete('/questions/:questionId', authenticateToken, ensureStaff, async (req, res) => {
   try {
-    const { error, count } = await supabase
-      .from('questions')
-      .delete({ count: 'exact' })
-      .eq('id', req.params.questionId);
-
-    if (error) throw error;
-    if (count === 0) return res.status(404).json({ success: false, message: 'Question not found' });
+    const deleted = await Question.findByIdAndDelete(req.params.questionId);
+    if (!deleted) return res.status(404).json({ success: false, message: 'Question not found' });
 
     res.json({ success: true, message: 'Question deleted successfully' });
   } catch (error) {
@@ -545,14 +462,7 @@ router.post(
       const studentId = req.user.id;
       const answersPayload = req.body.answers;
 
-      // Check if student already took this exam
-      const { data: existingResult } = await supabase
-        .from('results')
-        .select('id')
-        .eq('student_id', studentId)
-        .eq('exam_id', examId)
-        .maybeSingle();
-
+      const existingResult = await Result.findOne({ student_id: studentId, exam_id: examId }).select('_id').lean();
       if (existingResult) {
         return res.status(400).json({
           success: false,
@@ -560,12 +470,10 @@ router.post(
         });
       }
 
-      const { data: exam, error: examError } = await supabase.from('exams').select('*').eq('id', examId).single();
-      if (examError) throw examError;
+      const exam = await Exam.findById(examId).lean();
+      if (!exam) throw new Error('Exam not found');
 
-      const { data: questions, error: qError } = await supabase.from('questions').select('*').eq('exam_id', examId);
-      if (qError) throw qError;
-
+      const questions = await Question.find({ exam_id: examId }).lean();
       if (!questions.length) return res.status(400).json({ success: false, message: 'No questions for this exam' });
 
       const answerMap = new Map();
@@ -576,12 +484,12 @@ router.post(
       const studentAnswersToInsert = [];
 
       for (const q of questions) {
-        const providedAnswer = answerMap.get(String(q.id)) ?? null;
+        const providedAnswer = answerMap.get(String(q._id)) ?? null;
         const isCorrect = providedAnswer !== null && providedAnswer.toLowerCase() === String(q.correct_answer).toLowerCase();
         if (isCorrect) score += q.marks;
 
         feedback.push({
-          questionId: q.id,
+          questionId: q._id,
           questionText: q.question_text,
           studentAnswer: providedAnswer,
           correctAnswer: q.correct_answer,
@@ -593,33 +501,26 @@ router.post(
         if (providedAnswer !== null) {
           studentAnswersToInsert.push({
             student_id: studentId,
-            question_id: q.id,
+            question_id: q._id,
             answer: providedAnswer,
             is_correct: isCorrect
           });
         }
       }
 
-      // Cleanup old answers
-      await supabase.from('student_answers').delete().eq('student_id', studentId).in('question_id', questions.map(q => q.id));
-
-      // Batch insert new answers
+      const questionIds = questions.map(q => q._id);
+      await StudentAnswer.deleteMany({ student_id: studentId, question_id: { $in: questionIds } });
+      
       if (studentAnswersToInsert.length) {
-        const { error: batchError } = await supabase.from('student_answers').insert(studentAnswersToInsert);
-        if (batchError) throw batchError;
+        await StudentAnswer.insertMany(studentAnswersToInsert);
       }
 
-      // Upsert result
-      const { error: resultError } = await supabase
-        .from('results')
-        .upsert({
-          student_id: studentId,
-          exam_id: examId,
-          score,
-          submitted_at: new Date().toISOString()
-        }, { onConflict: 'student_id,exam_id' });
-
-      if (resultError) throw resultError;
+      await Result.create({
+        student_id: studentId,
+        exam_id: examId,
+        score,
+        submitted_at: new Date()
+      });
 
       const totalMarks = exam.total_marks || questions.reduce((sum, q) => sum + (q.marks || 0), 0);
       const percentage = totalMarks > 0 ? (score / totalMarks) * 100 : 0;
@@ -649,20 +550,17 @@ router.get('/:id/results', authenticateToken, ensureStaff, async (req, res) => {
   try {
     const examId = req.params.id;
 
-    const { data: exam, error: examError } = await supabase.from('exams').select('*').eq('id', examId).single();
-    if (examError) throw examError;
+    const exam = await Exam.findById(examId).lean();
+    if (!exam) throw new Error('Exam not found');
 
-    const { data: results, error: resError } = await supabase
-      .from('results')
-      .select('id, student_id, score, submitted_at, student:students(full_name, username)')
-      .eq('exam_id', examId)
-      .order('submitted_at', { ascending: false });
-
-    if (resError) throw resError;
+    const results = await Result.find({ exam_id: examId })
+      .populate('student_id', 'full_name username')
+      .sort({ submitted_at: -1 })
+      .lean();
 
     let totalMarks = exam.total_marks;
     if (!totalMarks) {
-      const { data: qMarks } = await supabase.from('questions').select('marks').eq('exam_id', examId);
+      const qMarks = await Question.find({ exam_id: examId }).select('marks').lean();
       totalMarks = qMarks.reduce((sum, q) => sum + (q.marks || 0), 0);
     }
 
@@ -674,19 +572,18 @@ router.get('/:id/results', authenticateToken, ensureStaff, async (req, res) => {
       else if (percentage >= 50) grade = 'C';
 
       return {
-        id: row.id,
-        student_id: row.student_id,
-        full_name: row.student?.full_name,
-        username: row.student?.username,
+        id: row._id,
+        student_id: row.student_id?._id,
+        full_name: row.student_id?.full_name,
+        username: row.student_id?.username,
         score: row.score,
-        submitted_at: row.submitted_at,
+        submitted_at: row.submitted_at || row.createdAt,
         total_marks: totalMarks,
         percentage: Math.round(percentage),
         grade
       };
     });
 
-    // Calculate Statistics
     const totalSubmissions = resultsWithGrades.length;
     const passCount = resultsWithGrades.filter(r => r.percentage >= 50).length;
     const failCount = totalSubmissions - passCount;
@@ -714,4 +611,3 @@ router.get('/:id/results', authenticateToken, ensureStaff, async (req, res) => {
 });
 
 module.exports = router;
-

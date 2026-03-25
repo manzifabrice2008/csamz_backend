@@ -1,9 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../config/database');
+const Student = require('../models/Student');
 const { authenticateToken } = require('../middleware/auth');
 
-// Middleware to ensure user is an admin
 const ensureAdmin = (req, res, next) => {
     if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'super_admin')) {
         return res.status(403).json({ success: false, message: 'Access denied. Admins only.' });
@@ -11,19 +10,22 @@ const ensureAdmin = (req, res, next) => {
     next();
 };
 
-// Get all students
 router.get('/', authenticateToken, ensureAdmin, async (req, res) => {
     try {
-        const { data: students, error } = await supabase
-            .from('students')
-            .select('id, full_name, username, email, phone_number, trade, level, status, created_at')
-            .order('created_at', { ascending: false });
+        const students = await Student.find()
+            .select('full_name username email phone_number trade level status createdAt')
+            .sort({ createdAt: -1 })
+            .lean();
 
-        if (error) throw error;
+        const formattedStudents = students.map(s => ({
+            id: s._id,
+            ...s,
+            created_at: s.createdAt
+        }));
 
         res.json({
             success: true,
-            students
+            students: formattedStudents
         });
     } catch (error) {
         console.error('Admin get students error:', error);
@@ -31,7 +33,6 @@ router.get('/', authenticateToken, ensureAdmin, async (req, res) => {
     }
 });
 
-// Update student status
 router.patch('/:id/status', authenticateToken, ensureAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -41,19 +42,16 @@ router.patch('/:id/status', authenticateToken, ensureAdmin, async (req, res) => 
             return res.status(400).json({ success: false, message: 'Invalid status' });
         }
 
-        const { data, error } = await supabase
-            .from('students')
-            .update({ status })
-            .eq('id', id)
-            .select()
-            .single();
+        const student = await Student.findByIdAndUpdate(id, { status }, { new: true }).lean();
 
-        if (error) throw error;
+        if (!student) {
+            return res.status(404).json({ success: false, message: 'Student not found' });
+        }
 
         res.json({
             success: true,
             message: `Student status updated to ${status}`,
-            student: data
+            student: { id: student._id, ...student, created_at: student.createdAt }
         });
     } catch (error) {
         console.error('Update student status error:', error);
@@ -61,31 +59,15 @@ router.patch('/:id/status', authenticateToken, ensureAdmin, async (req, res) => 
     }
 });
 
-// Delete student
 router.delete('/:id', authenticateToken, ensureAdmin, async (req, res) => {
     try {
         const { id } = req.params;
 
-        // First check if student exists
-        const { data: student, error: fetchError } = await supabase
-            .from('students')
-            .select('id')
-            .eq('id', id)
-            .maybeSingle();
+        const student = await Student.findByIdAndDelete(id);
 
-        if (fetchError) throw fetchError;
         if (!student) {
             return res.status(404).json({ success: false, message: 'Student not found' });
         }
-
-        // Delete from students table (cascading deletes should handle related records if configured, 
-        // otherwise we might need to delete results, etc manually if no FK cascade is set)
-        const { error: deleteError } = await supabase
-            .from('students')
-            .delete()
-            .eq('id', id);
-
-        if (deleteError) throw deleteError;
 
         res.json({
             success: true,

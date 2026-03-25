@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../config/database');
+const Attendance = require('../models/Attendance');
 const { authenticateToken } = require('../middleware/auth');
 
 // Get attendance history
@@ -11,21 +11,15 @@ router.get('/', authenticateToken, async (req, res) => {
         }
 
         const { month, year } = req.query;
-        let query = supabase
-            .from('attendance')
-            .select('*')
-            .eq('student_id', req.user.id);
+        let query = { student_id: req.user.id };
 
         if (month && year) {
-            // PostgreSQL month/year extraction
             const startDate = new Date(year, month - 1, 1).toISOString();
             const endDate = new Date(year, month, 0, 23, 59, 59).toISOString();
-            query = query.gte('date', startDate).lte('date', endDate);
+            query.date = { $gte: startDate, $lte: endDate };
         }
 
-        const { data: rows, error } = await query.order('date', { ascending: false });
-
-        if (error) throw error;
+        const rows = await Attendance.find(query).sort({ date: -1 }).lean();
 
         res.json({
             success: true,
@@ -44,12 +38,7 @@ router.get('/summary', authenticateToken, async (req, res) => {
             return res.status(403).json({ success: false, message: 'Access denied' });
         }
 
-        const { data: rows, error } = await supabase
-            .from('attendance')
-            .select('status')
-            .eq('student_id', req.user.id);
-
-        if (error) throw error;
+        const rows = await Attendance.find({ student_id: req.user.id }).select('status').lean();
 
         const summary = {
             present: 0,

@@ -1,9 +1,11 @@
 const express = require('express');
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
-const crypto = require('crypto');
 const { body, validationResult } = require('express-validator');
-const { supabase } = require('../config/database');
+const Admin = require('../models/Admin');
+const AdminNotificationSetting = require('../models/AdminNotificationSetting');
+const SiteSetting = require('../models/SiteSetting');
+const SMSSetting = require('../models/SMSSetting');
 const { authenticateToken } = require('../middleware/auth');
 const emailService = require('../services/email');
 
@@ -19,94 +21,50 @@ const validate = (req, res, next) => {
 };
 
 const ensureNotificationSettings = async (adminId) => {
-  const { data: existing, error: fetchError } = await supabase
-    .from('admin_notification_settings')
-    .select('*')
-    .eq('admin_id', adminId)
-    .single();
-
-  if (fetchError && fetchError.code === 'PGRST116') {
-    const { data: inserted, error: insertError } = await supabase
-      .from('admin_notification_settings')
-      .insert([{ admin_id: adminId }])
-      .select()
-      .single();
-
-    if (insertError) throw insertError;
-    return inserted;
-  }
-
-  if (fetchError) throw fetchError;
-  return existing;
+  const settings = await AdminNotificationSetting.findOneAndUpdate(
+    { admin_id: adminId },
+    {},
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  ).lean();
+  return settings;
 };
 
 const getSiteSettings = async () => {
-  const { data, error } = await supabase
-    .from('site_settings')
-    .select('*')
-    .limit(1)
-    .maybeSingle();
-
-  if (error) throw error;
-
-  if (!data) {
-    const { data: inserted, error: insertError } = await supabase
-      .from('site_settings')
-      .insert([{
-        site_name: 'CSAM Zaccaria TVET',
-        site_tagline: 'Excellence in Technical Education',
-        contact_email: 'info@csam.edu',
-        contact_phone: '+250 000 000 000',
-        contact_address: 'Gicumbi, Rwanda'
-      }])
-      .select()
-      .single();
-
-    if (insertError) throw insertError;
-    return inserted;
+  let settings = await SiteSetting.findOne().lean();
+  if (!settings) {
+    const newSettings = await SiteSetting.create({
+      site_name: 'CSAM Zaccaria TVET',
+      site_tagline: 'Excellence in Technical Education',
+      contact_email: 'info@csam.edu',
+      contact_phone: '+250 000 000 000',
+      contact_address: 'Gicumbi, Rwanda'
+    });
+    settings = newSettings.toObject();
   }
-  return data;
+  return settings;
 };
 
 const getSMSSettings = async () => {
-  const { data, error } = await supabase
-    .from('sms_settings')
-    .select('*')
-    .limit(1)
-    .maybeSingle();
-
-  if (error) throw error;
-
-  if (!data) {
-    const { data: inserted, error: insertError } = await supabase
-      .from('sms_settings')
-      .insert([{ provider: 'console', enabled: false }])
-      .select()
-      .single();
-
-    if (insertError) throw insertError;
-    return inserted;
+  let settings = await SMSSetting.findOne().lean();
+  if (!settings) {
+    const newSettings = await SMSSetting.create({
+      provider: 'console',
+      enabled: false
+    });
+    settings = newSettings.toObject();
   }
-  return data;
+  return settings;
 };
 
 // Profile routes
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
-    const { data: admin, error } = await supabase
-      .from('admins')
-      .select('id, username, email, full_name, role, created_at, updated_at')
-      .eq('id', req.user.id)
-      .single();
-
-    if (error) {
-      if (error.code === 'PGRST116') {
-        return res.status(404).json({ success: false, message: 'Admin not found' });
-      }
-      throw error;
+    const admin = await Admin.findById(req.user.id).select('username email full_name role createdAt updatedAt').lean();
+    if (!admin) {
+      return res.status(404).json({ success: false, message: 'Admin not found' });
     }
-
-    res.json({ success: true, profile: admin });
+    
+    res.json({ success: true, profile: { id: admin._id, ...admin, created_at: admin.createdAt, updated_at: admin.updatedAt } });
   } catch (error) {
     console.error('Get profile error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching profile' });
@@ -127,27 +85,19 @@ router.put(
       const { username, email, full_name } = req.body;
       const adminId = req.user.id;
 
-      const { data: conflicts, error: fetchError } = await supabase
-        .from('admins')
-        .select('id')
-        .or(`username.eq.${username},email.eq.${email}`)
-        .neq('id', adminId);
+      const conflicts = await Admin.findOne({
+        $or: [{ username }, { email }],
+        _id: { $ne: adminId }
+      }).select('_id').lean();
 
-      if (fetchError) throw fetchError;
-
-      if (conflicts && conflicts.length > 0) {
+      if (conflicts) {
         return res.status(400).json({
           success: false,
           message: 'Username or email already in use by another admin'
         });
       }
 
-      const { error: updateError } = await supabase
-        .from('admins')
-        .update({ username, email, full_name, updated_at: new Date().toISOString() })
-        .eq('id', adminId);
-
-      if (updateError) throw updateError;
+      await Admin.findByIdAndUpdate(adminId, { username, email, full_name, updatedAt: new Date() });
 
       res.json({
         success: true,
@@ -174,13 +124,8 @@ router.put(
       const { current_password, new_password } = req.body;
       const adminId = req.user.id;
 
-      const { data: admin, error: fetchError } = await supabase
-        .from('admins')
-        .select('password')
-        .eq('id', adminId)
-        .single();
-
-      if (fetchError) throw fetchError;
+      const admin = await Admin.findById(adminId).select('password').lean();
+      if (!admin) throw new Error('Admin not found');
 
       const passwordMatch = await bcrypt.compare(current_password, admin.password);
       if (!passwordMatch) {
@@ -190,12 +135,7 @@ router.put(
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(new_password, salt);
 
-      const { error: updateError } = await supabase
-        .from('admins')
-        .update({ password: hashedPassword, updated_at: new Date().toISOString() })
-        .eq('id', adminId);
-
-      if (updateError) throw updateError;
+      await Admin.findByIdAndUpdate(adminId, { password: hashedPassword, updatedAt: new Date() });
 
       res.json({ success: true, message: 'Password updated successfully' });
     } catch (error) {
@@ -237,17 +177,11 @@ router.put(
     try {
       const { email_notifications, sms_notifications, in_app_notifications } = req.body;
 
-      const { error } = await supabase
-        .from('admin_notification_settings')
-        .update({
-          email_notifications: email_notifications ? 1 : 0,
-          sms_notifications: sms_notifications ? 1 : 0,
-          in_app_notifications: in_app_notifications ? 1 : 0,
-          updated_at: new Date().toISOString()
-        })
-        .eq('admin_id', req.user.id);
-
-      if (error) throw error;
+      await AdminNotificationSetting.findOneAndUpdate(
+        { admin_id: req.user.id },
+        { email_notifications, sms_notifications, in_app_notifications, updatedAt: new Date() },
+        { upsert: true }
+      );
 
       res.json({
         success: true,
@@ -269,7 +203,7 @@ router.put(
 router.get('/site', authenticateToken, async (req, res) => {
   try {
     const settings = await getSiteSettings();
-    res.json({ success: true, settings });
+    res.json({ success: true, settings: { id: settings._id, ...settings } });
   } catch (error) {
     console.error('Get site settings error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching site settings' });
@@ -305,27 +239,20 @@ router.put(
         instagram_url
       } = req.body;
 
-      const { data: updated, error } = await supabase
-        .from('site_settings')
-        .update({
-          site_name,
-          site_tagline: site_tagline || null,
-          contact_email: contact_email || null,
-          contact_phone: contact_phone || null,
-          contact_address: contact_address || null,
-          facebook_url: facebook_url || null,
-          twitter_url: twitter_url || null,
-          instagram_url: instagram_url || null,
-          updated_by: req.user.id,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', settings.id)
-        .select()
-        .single();
+      const updated = await SiteSetting.findByIdAndUpdate(settings._id, {
+        site_name,
+        site_tagline: site_tagline || null,
+        contact_email: contact_email || null,
+        contact_phone: contact_phone || null,
+        contact_address: contact_address || null,
+        facebook_url: facebook_url || null,
+        twitter_url: twitter_url || null,
+        instagram_url: instagram_url || null,
+        updated_by: req.user.id,
+        updatedAt: new Date()
+      }, { new: true }).lean();
 
-      if (error) throw error;
-
-      res.json({ success: true, message: 'Site settings updated successfully', settings: updated });
+      res.json({ success: true, message: 'Site settings updated successfully', settings: { id: updated._id, ...updated } });
     } catch (error) {
       console.error('Update site settings error:', error);
       res.status(500).json({ success: false, message: 'Server error updating site settings' });
@@ -341,6 +268,7 @@ router.get('/sms', authenticateToken, async (req, res) => {
     res.json({
       success: true,
       settings: {
+        id: settings._id,
         ...settings,
         enabled: Boolean(settings.enabled),
         additional_config: settings.additional_config ? (typeof settings.additional_config === 'string' ? JSON.parse(settings.additional_config) : settings.additional_config) : {}
@@ -387,28 +315,22 @@ router.put(
         }
       }
 
-      const { data: updated, error } = await supabase
-        .from('sms_settings')
-        .update({
-          provider,
-          enabled: enabled ? 1 : 0,
-          sender_id: sender_id || null,
-          username: username || null,
-          api_key: api_key || null,
-          additional_config: configToStore || null,
-          updated_by: req.user.id,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', settings.id)
-        .select()
-        .single();
-
-      if (error) throw error;
+      const updated = await SMSSetting.findByIdAndUpdate(settings._id, {
+        provider,
+        enabled,
+        sender_id: sender_id || null,
+        username: username || null,
+        api_key: api_key || null,
+        additional_config: configToStore || null,
+        updated_by: req.user.id,
+        updatedAt: new Date()
+      }, { new: true }).lean();
 
       res.json({
         success: true,
         message: 'SMS settings updated successfully',
         settings: {
+          id: updated._id,
           ...updated,
           enabled: Boolean(updated.enabled),
           additional_config: updated.additional_config ? (typeof updated.additional_config === 'string' ? JSON.parse(updated.additional_config) : updated.additional_config) : {}
