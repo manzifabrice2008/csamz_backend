@@ -261,7 +261,7 @@ router.delete('/:id', authenticateToken, ensureStaff, async (req, res) => {
   }
 });
 
-router.get('/:id/questions', async (req, res) => {
+router.get('/:id/questions', authenticateToken, async (req, res) => {
   try {
     const examId = req.params.id;
 
