@@ -21,7 +21,10 @@ const safeParseOptions = (value, fallback = []) => {
   }
 };
 
-const getGrade = (percentage) => {
+const getGrade = (score, totalMarks) => {
+  const percentage = totalMarks > 0 ? (score / totalMarks) * 100 : 0;
+
+  if (totalMarks > 0 && score >= totalMarks) return 'Pass';
   if (percentage > 80) return 'A';
   if (percentage >= 70) return 'B';
   if (percentage >= 50) return 'C';
@@ -87,7 +90,7 @@ router.get('/history', authenticateToken, async (req, res) => {
         score: row.score,
         totalMarks: total_marks,
         percentage: Math.round(percentage),
-        grade: getGrade(percentage),
+        grade: getGrade(row.score, total_marks),
         rank: ranksByResultId.get(String(row._id)) || null,
         trade: row.exam_id?.trade || null,
         level: row.exam_id?.level || null,
@@ -202,7 +205,7 @@ router.get('/:studentId/:examId', authenticateToken, async (req, res) => {
         score: result.score,
         total_marks: totalMarks,
         percentage: Math.round(percentage),
-        grade: getGrade(percentage),
+        grade: getGrade(result.score, totalMarks),
         rank: rank || null,
         submitted_at: result.submitted_at || result.createdAt,
       },

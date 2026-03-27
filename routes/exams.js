@@ -47,6 +47,16 @@ const generateExamCode = () => {
   return `EX-${timestamp}-${randomPart}`;
 };
 
+const getExamGrade = (score, totalMarks) => {
+  const percentage = totalMarks > 0 ? (score / totalMarks) * 100 : 0;
+
+  if (totalMarks > 0 && score >= totalMarks) return 'Pass';
+  if (percentage > 80) return 'A';
+  if (percentage >= 70) return 'B';
+  if (percentage >= 50) return 'C';
+  return 'Fail';
+};
+
 const normalizeQuestion = (row, includeAnswer = true) => ({
   id: row._id,
   question_text: row.question_text,
@@ -558,10 +568,7 @@ router.post(
       const totalMarks = exam.total_marks || questions.reduce((sum, q) => sum + (q.marks || 0), 0);
       const percentage = totalMarks > 0 ? (score / totalMarks) * 100 : 0;
 
-      let grade = 'Fail';
-      if (percentage > 80) grade = 'A';
-      else if (percentage >= 70) grade = 'B';
-      else if (percentage >= 50) grade = 'C';
+      const grade = getExamGrade(score, totalMarks);
 
       res.json({
         success: true,
@@ -599,10 +606,7 @@ router.get('/:id/results', authenticateToken, ensureStaff, async (req, res) => {
 
     const resultsWithGrades = results.map(row => {
       const percentage = totalMarks > 0 ? (row.score / totalMarks) * 100 : 0;
-      let grade = 'Fail';
-      if (percentage > 80) grade = 'A';
-      else if (percentage >= 70) grade = 'B';
-      else if (percentage >= 50) grade = 'C';
+      const grade = getExamGrade(row.score, totalMarks);
 
       return {
         id: row._id,
