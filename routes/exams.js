@@ -82,6 +82,7 @@ router.get('/', authenticateToken, async (req, res) => {
 
       query.trade = normalizeTradeValue(student.trade);
       query.level = normalizeLevelValue(student.level);
+      query.$or = [{ status: 'published' }, { status: { $exists: false } }];
     } else if (teacherId) {
       query.teacher_id = teacherId;
     }
@@ -186,7 +187,8 @@ router.post(
         total_marks,
         teacher_id: teacherId,
         trade,
-        level
+        level,
+        status: 'draft',
       });
 
       res.status(201).json({
@@ -305,6 +307,13 @@ router.get('/:id/questions', authenticateToken, async (req, res) => {
         return res.status(403).json({
           success: false,
           message: 'This exam is not assigned to your trade and class',
+        });
+      }
+
+      if (exam.status && exam.status !== 'published') {
+        return res.status(403).json({
+          success: false,
+          message: 'This exam is not published yet',
         });
       }
     }
@@ -481,6 +490,46 @@ router.delete('/questions/:questionId', authenticateToken, ensureStaff, async (r
   } catch (error) {
     console.error('Delete question error:', error);
     res.status(500).json({ success: false, message: 'Failed to delete question' });
+  }
+});
+
+router.patch('/:id/publish', authenticateToken, ensureStaff, async (req, res) => {
+  try {
+    const examId = req.params.id;
+
+    const exam = await Exam.findById(examId).lean();
+    if (!exam) {
+      return res.status(404).json({ success: false, message: 'Exam not found' });
+    }
+
+    if (req.user?.role === 'teacher' && String(exam.teacher_id) !== String(req.user.id)) {
+      return res.status(403).json({ success: false, message: 'You can only publish your own exams' });
+    }
+
+    const questionRows = await Question.find({ exam_id: examId }).select('marks').lean();
+    if (!questionRows.length) {
+      return res.status(400).json({ success: false, message: 'Add at least one question before publishing the exam' });
+    }
+
+    const calculatedTotalMarks = questionRows.reduce((sum, question) => sum + (question.marks || 0), 0);
+
+    const updated = await Exam.findByIdAndUpdate(
+      examId,
+      {
+        status: 'published',
+        total_marks: exam.total_marks > 0 ? exam.total_marks : calculatedTotalMarks,
+      },
+      { new: true }
+    ).lean();
+
+    res.json({
+      success: true,
+      message: 'Exam published successfully',
+      exam: { id: updated._id, ...updated, created_at: updated.createdAt, updated_at: updated.updatedAt },
+    });
+  } catch (error) {
+    console.error('Publish exam error:', error);
+    res.status(500).json({ success: false, message: 'Failed to publish exam' });
   }
 });
 

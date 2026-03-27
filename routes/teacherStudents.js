@@ -147,4 +147,37 @@ router.get('/:id', authenticateToken, ensureTeacher, async (req, res) => {
     }
 });
 
+router.delete('/:id', authenticateToken, ensureTeacher, async (req, res) => {
+    try {
+        const studentId = req.params.id;
+        const teacher = await Teacher.findById(req.user.id).select('trade trades level levels').lean();
+
+        if (!teacher) {
+            return res.status(404).json({ success: false, message: 'Teacher profile error' });
+        }
+
+        const trades = getTeacherTrades(teacher);
+        const levels = getTeacherLevels(teacher);
+        const levelFilter = buildLevelFilter(levels);
+
+        const student = await Student.findOneAndDelete({
+            _id: studentId,
+            ...buildTradeFilter(trades),
+            ...levelFilter
+        }).lean();
+
+        if (!student) {
+            return res.status(404).json({ success: false, message: 'Student not found' });
+        }
+
+        res.json({
+            success: true,
+            message: 'Student deleted successfully'
+        });
+    } catch (error) {
+        console.error('Teacher delete student error:', error);
+        res.status(500).json({ success: false, message: 'Failed to delete student' });
+    }
+});
+
 module.exports = router;

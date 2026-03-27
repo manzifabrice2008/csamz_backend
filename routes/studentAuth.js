@@ -29,10 +29,21 @@ router.post('/register',
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        return res.status(400).json({ success: false, errors: errors.array() });
+        const validationErrors = errors.array();
+        return res.status(400).json({
+          success: false,
+          message: validationErrors[0]?.msg || 'Please check your registration details.',
+          errors: validationErrors,
+        });
       }
 
-      const { username, password, full_name, email, phone_number } = req.body;
+      const username = req.body.username.trim();
+      const password = req.body.password;
+      const full_name = req.body.full_name.trim();
+      const email = typeof req.body.email === 'string' && req.body.email.trim()
+        ? req.body.email.trim().toLowerCase()
+        : undefined;
+      const phone_number = req.body.phone_number.trim();
       const trade = normalizeTradeValue(req.body.trade);
       const level = normalizeLevelValue(req.body.level);
 
@@ -81,6 +92,9 @@ router.post('/register',
       });
     } catch (error) {
       console.error('Student register error:', error);
+      if (error?.code === 11000) {
+        return res.status(400).json({ success: false, message: 'Username or email already in use' });
+      }
       res.status(500).json({ success: false, message: 'Server error' });
     }
   }

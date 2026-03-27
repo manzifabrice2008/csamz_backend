@@ -43,10 +43,18 @@ router.post(
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        return res.status(400).json({ success: false, errors: errors.array() });
+        const validationErrors = errors.array();
+        return res.status(400).json({
+          success: false,
+          message: validationErrors[0]?.msg || 'Please check your registration details.',
+          errors: validationErrors,
+        });
       }
 
-      const { full_name, username, email, password } = req.body;
+      const full_name = req.body.full_name.trim();
+      const username = req.body.username.trim();
+      const email = req.body.email.trim().toLowerCase();
+      const password = req.body.password;
       const trades = normalizeStringArray(req.body.trades);
       const levels = normalizeStringArray(req.body.levels).filter((level) => validLevels.has(level));
       const trade = trades[0];
@@ -94,6 +102,9 @@ router.post(
       });
     } catch (error) {
       console.error('Teacher register error:', error);
+      if (error?.code === 11000) {
+        return res.status(400).json({ success: false, message: 'Username or email already in use' });
+      }
       res.status(500).json({ success: false, message: 'Server error during registration' });
     }
   }
