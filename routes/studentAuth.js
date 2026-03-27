@@ -114,6 +114,9 @@ router.post('/login',
         return res.status(401).json({ success: false, message: 'Invalid credentials' });
       }
 
+      student.last_seen_at = new Date();
+      await student.save();
+
       const token = jwt.sign(
         {
           id: student._id,

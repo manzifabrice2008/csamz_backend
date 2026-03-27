@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const SiteAnalytics = require('../models/SiteAnalytics');
+const Student = require('../models/Student');
+const Teacher = require('../models/Teacher');
 const { authenticateToken } = require('../middleware/auth');
 
 /**
@@ -51,6 +53,20 @@ router.get('/overview', authenticateToken, async (req, res) => {
         });
 
         const totalCount = await SiteAnalytics.countDocuments();
+        const onlineThreshold = new Date(Date.now() - (5 * 60 * 1000));
+
+        const [studentsTotal, studentsOnline, teachersTotal, teachersOnline] = await Promise.all([
+            Student.countDocuments(),
+            Student.countDocuments({
+                status: 'active',
+                last_seen_at: { $gte: onlineThreshold }
+            }),
+            Teacher.countDocuments({ status: 'approved' }),
+            Teacher.countDocuments({
+                status: 'approved',
+                last_seen_at: { $gte: onlineThreshold }
+            }),
+        ]);
 
         let trend = 0;
         if (lastMonthCount > 0) {
@@ -66,7 +82,11 @@ router.get('/overview', authenticateToken, async (req, res) => {
                 last_month_visitors: lastMonthCount || 0,
                 total_visitors: totalCount || 0,
                 trend: trend,
-                is_table_missing: false
+                is_table_missing: false,
+                students_total: studentsTotal || 0,
+                students_online: studentsOnline || 0,
+                teachers_total: teachersTotal || 0,
+                teachers_online: teachersOnline || 0,
             }
         });
 

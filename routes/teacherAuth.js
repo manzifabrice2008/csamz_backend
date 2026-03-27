@@ -135,6 +135,9 @@ router.post(
         return res.status(401).json({ success: false, message: 'Invalid credentials' });
       }
 
+      teacher.last_seen_at = new Date();
+      await teacher.save();
+
       const token = jwt.sign(
         {
           id: teacher._id,

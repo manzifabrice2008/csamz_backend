@@ -42,6 +42,10 @@ const studentSchema = new mongoose.Schema({
     enum: ['active', 'inactive'],
     default: 'active',
   },
+  last_seen_at: {
+    type: Date,
+    default: null,
+  },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Student', studentSchema);
