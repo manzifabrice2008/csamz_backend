@@ -412,11 +412,24 @@ router.patch(
         return res.status(404).json({ success: false, message: 'Teacher not found' });
       }
 
-      sendTeacherStatusUpdate(teacher, status).catch(err =>
-        console.error('Failed to send teacher status update email:', err)
-      );
+      let emailResult = { success: false, error: 'Email was not attempted' };
 
-      res.json({ success: true, message: `Teacher status updated to ${status}` });
+      if (teacher.email) {
+        emailResult = await sendTeacherStatusUpdate(teacher, status);
+      } else {
+        console.warn(`Teacher ${teacher._id} has no email address. Skipping status email.`);
+        emailResult = { success: false, error: 'Teacher does not have an email address' };
+      }
+
+      res.json({
+        success: true,
+        message: `Teacher status updated to ${status}`,
+        email: {
+          attempted: Boolean(teacher.email),
+          sent: emailResult.success,
+          error: emailResult.success ? null : emailResult.error || 'Failed to send status email',
+        },
+      });
     } catch (error) {
       console.error('Update teacher status error:', error);
       res.status(500).json({ success: false, message: 'Server error' });

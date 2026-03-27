@@ -6,78 +6,13 @@ const { body, validationResult } = require('express-validator');
 const Admin = require('../models/Admin');
 require('dotenv').config();
 
-// Register new admin
-router.post('/register',
-  [
-    body('username').trim().isLength({ min: 3 }).withMessage('Username must be at least 3 characters'),
-    body('email').isEmail().withMessage('Please provide a valid email'),
-    body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
-    body('full_name').trim().notEmpty().withMessage('Full name is required')
-  ],
-  async (req, res) => {
-    try {
-      // Validate input
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({
-          success: false,
-          errors: errors.array()
-        });
-      }
-
-      const { username, email, password, full_name, role = 'admin' } = req.body;
-
-      // Check if user already exists
-      const existingUser = await Admin.findOne({ $or: [{ email }, { username }] });
-
-      if (existingUser) {
-        return res.status(400).json({
-          success: false,
-          message: 'User with this email or username already exists'
-        });
-      }
-
-      // Hash password
-      const salt = await bcrypt.genSalt(10);
-      const hashedPassword = await bcrypt.hash(password, salt);
-
-      // Insert new admin
-      const newUser = await Admin.create({
-        username,
-        email,
-        password: hashedPassword,
-        full_name,
-        role
-      });
-
-      // Create JWT token
-      const token = jwt.sign(
-        { id: newUser._id, username, email, role },
-        process.env.JWT_SECRET,
-        { expiresIn: '7d' }
-      );
-
-      res.status(201).json({
-        success: true,
-        message: 'Admin registered successfully',
-        token,
-        user: {
-          id: newUser._id,
-          username,
-          email,
-          full_name,
-          role
-        }
-      });
-    } catch (error) {
-      console.error('Registration error:', error);
-      res.status(500).json({
-        success: false,
-        message: 'Server error during registration'
-      });
-    }
-  }
-);
+// Public admin self-registration is disabled.
+router.post('/register', (req, res) => {
+  return res.status(403).json({
+    success: false,
+    message: 'Admin registration is disabled. Contact the system administrator.'
+  });
+});
 
 // Login admin
 router.post('/login',
