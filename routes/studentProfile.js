@@ -7,6 +7,7 @@ const Assignment = require('../models/Assignment');
 const Exam = require('../models/Exam');
 const bcrypt = require('bcryptjs');
 const { authenticateToken } = require('../middleware/auth');
+const { normalizeTradeValue, normalizeLevelValue, normalizeStudentRecord } = require('../utils/studentClassification');
 
 // Get student profile
 router.get('/profile', authenticateToken, async (req, res) => {
@@ -21,10 +22,11 @@ router.get('/profile', authenticateToken, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Student not found' });
     }
 
+    const normalizedStudent = normalizeStudentRecord(student);
     const formattedStudent = {
-      id: student._id,
-      ...student,
-      phone: student.phone_number
+      id: normalizedStudent._id,
+      ...normalizedStudent,
+      phone: normalizedStudent.phone_number
     };
 
     res.json({ success: true, student: formattedStudent });
@@ -44,6 +46,8 @@ router.put('/profile',
     body('date_of_birth').optional({ checkFalsy: true }).isISO8601().withMessage('Invalid date format'),
     body('address').optional({ checkFalsy: true }).isLength({ max: 500 }).withMessage('Address too long'),
     body('emergency_contact').optional({ checkFalsy: true }).isLength({ max: 200 }).withMessage('Emergency contact too long'),
+    body('trade').optional({ checkFalsy: true }).trim().notEmpty().withMessage('Trade is required'),
+    body('level').optional({ checkFalsy: true }).isIn(['L3', 'L4', 'L5']).withMessage('Valid level is required'),
   ],
   async (req, res) => {
     try {
@@ -62,7 +66,9 @@ router.put('/profile',
         phone,
         date_of_birth,
         address,
-        emergency_contact
+        emergency_contact,
+        trade,
+        level
       } = req.body;
 
       if (email) {
@@ -76,18 +82,22 @@ router.put('/profile',
         full_name,
         email: email || null,
         phone_number: phone || null,
+        trade: trade ? normalizeTradeValue(trade) : undefined,
+        level: level ? normalizeLevelValue(level) : undefined,
         date_of_birth: date_of_birth || null,
         address: address || null,
         emergency_contact: emergency_contact || null
       }, { new: true }).lean();
 
+      const normalizedUpdated = normalizeStudentRecord(updated);
+
       res.json({
         success: true,
         message: 'Profile updated successfully',
         student: {
-          id: updated._id,
-          ...updated,
-          phone: updated.phone_number
+          id: normalizedUpdated._id,
+          ...normalizedUpdated,
+          phone: normalizedUpdated.phone_number
         }
       });
     } catch (error) {

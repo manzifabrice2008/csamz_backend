@@ -6,6 +6,9 @@ const teacherSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   trade: { type: String, required: true },
+  trades: [{ type: String }],
+  level: { type: String, enum: ['L3', 'L4', 'L5'], required: true, default: 'L3' },
+  levels: [{ type: String, enum: ['L3', 'L4', 'L5'] }],
   status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
 }, { timestamps: true });
 

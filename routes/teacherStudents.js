@@ -3,6 +3,8 @@ const router = express.Router();
 const Teacher = require('../models/Teacher');
 const Student = require('../models/Student');
 const { authenticateToken } = require('../middleware/auth');
+const { getTeacherTrades, getTeacherLevels } = require('../utils/teacherAssignments');
+const { normalizeStudentRecord } = require('../utils/studentClassification');
 
 const ensureTeacher = (req, res, next) => {
     if (!req.user || req.user.role !== 'teacher') {
@@ -11,29 +13,86 @@ const ensureTeacher = (req, res, next) => {
     next();
 };
 
-// Get all students (filtered by teacher's trade)
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const buildTradeFilter = (trades) => {
+    const normalizedTrades = Array.isArray(trades) ? trades.filter(Boolean) : [];
+    if (normalizedTrades.length === 0) {
+        return {};
+    }
+
+    return {
+        $or: normalizedTrades.map((trade) => ({
+            trade: { $regex: `^${escapeRegex(trade.trim())}$`, $options: 'i' }
+        }))
+    };
+};
+
+const buildLevelFilter = (levels) => {
+    const normalizedLevels = Array.isArray(levels) ? levels.filter(Boolean) : [];
+    const conditions = [];
+
+    normalizedLevels.forEach((level) => {
+        const levelNumber = String(level).replace(/[^0-9]/g, '');
+        const patterns = [
+            `^${escapeRegex(level)}$`,
+            `^Level\\s*${escapeRegex(levelNumber)}$`,
+        ];
+
+        if (levelNumber) {
+            patterns.push(`^${escapeRegex(levelNumber)}$`);
+            patterns.push(`^L\\s*${escapeRegex(levelNumber)}$`);
+        }
+
+        conditions.push({
+            $or: patterns.map((pattern) => ({
+                level: { $regex: pattern, $options: 'i' }
+            }))
+        });
+    });
+
+    // Backward compatibility: older student accounts were created before level was
+    // persisted, so treat missing level as L3 because the student form defaulted to L3.
+    if (normalizedLevels.includes('L3')) {
+        conditions.push({ level: { $exists: false } });
+        conditions.push({ level: null });
+        conditions.push({ level: '' });
+    }
+
+    return conditions.length > 0 ? { $or: conditions } : {};
+};
+
+// Get all students filtered by the teacher's assigned trades and classes
 router.get('/', authenticateToken, ensureTeacher, async (req, res) => {
     try {
         const teacherId = req.user.id;
 
-        const teacher = await Teacher.findById(teacherId).select('trade').lean();
+        const teacher = await Teacher.findById(teacherId).select('trade trades level levels').lean();
         if (!teacher) {
             return res.status(404).json({ success: false, message: 'Teacher profile error' });
         }
 
-        const trade = teacher.trade;
+        const trades = getTeacherTrades(teacher);
+        const levels = getTeacherLevels(teacher);
+        const levelFilter = buildLevelFilter(levels);
 
-        const students = await Student.find({ trade })
+        const students = await Student.find({
+            ...buildTradeFilter(trades),
+            ...levelFilter
+        })
             .select('_id full_name email phone_number trade level status createdAt')
-            .sort({ full_name: 1 })
+            .sort({ level: 1, full_name: 1 })
             .lean();
 
-        const formattedStudents = students.map(s => ({
-            id: s._id,
-            ...s,
-            phone: s.phone_number,
-            created_at: s.createdAt
-        }));
+        const formattedStudents = students.map((s) => {
+            const normalized = normalizeStudentRecord(s);
+            return {
+                id: normalized._id,
+                ...normalized,
+                phone: normalized.phone_number,
+                created_at: s.createdAt
+            };
+        });
 
         res.json({
             success: true,
@@ -50,8 +109,21 @@ router.get('/', authenticateToken, ensureTeacher, async (req, res) => {
 router.get('/:id', authenticateToken, ensureTeacher, async (req, res) => {
     try {
         const studentId = req.params.id;
+        const teacher = await Teacher.findById(req.user.id).select('trade trades level levels').lean();
 
-        const student = await Student.findById(studentId)
+        if (!teacher) {
+            return res.status(404).json({ success: false, message: 'Teacher profile error' });
+        }
+
+        const trades = getTeacherTrades(teacher);
+        const levels = getTeacherLevels(teacher);
+        const levelFilter = buildLevelFilter(levels);
+
+        const student = await Student.findOne({
+            _id: studentId,
+            ...buildTradeFilter(trades),
+            ...levelFilter
+        })
             .select('_id full_name email phone_number trade level status createdAt')
             .lean();
 
@@ -63,7 +135,7 @@ router.get('/:id', authenticateToken, ensureTeacher, async (req, res) => {
             success: true,
             student: {
                 id: student._id,
-                ...student,
+                ...normalizeStudentRecord(student),
                 phone: student.phone_number,
                 created_at: student.createdAt
             }

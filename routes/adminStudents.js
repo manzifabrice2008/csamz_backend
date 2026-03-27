@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Student = require('../models/Student');
 const { authenticateToken } = require('../middleware/auth');
+const { normalizeStudentRecord } = require('../utils/studentClassification');
 
 const ensureAdmin = (req, res, next) => {
     if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'super_admin')) {
@@ -17,11 +18,14 @@ router.get('/', authenticateToken, ensureAdmin, async (req, res) => {
             .sort({ createdAt: -1 })
             .lean();
 
-        const formattedStudents = students.map(s => ({
-            id: s._id,
-            ...s,
-            created_at: s.createdAt
-        }));
+        const formattedStudents = students.map((s) => {
+            const normalized = normalizeStudentRecord(s);
+            return {
+                id: normalized._id,
+                ...normalized,
+                created_at: s.createdAt
+            };
+        });
 
         res.json({
             success: true,

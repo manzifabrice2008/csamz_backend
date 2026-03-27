@@ -7,6 +7,9 @@ const Result = require('../models/Result');
 const StudentAnswer = require('../models/StudentAnswer');
 const Teacher = require('../models/Teacher');
 const { authenticateToken } = require('../middleware/auth');
+const { getTeacherTrades, getTeacherLevels } = require('../utils/teacherAssignments');
+const Student = require('../models/Student');
+const { normalizeTradeValue, normalizeLevelValue } = require('../utils/studentClassification');
 
 const STAFF_ROLES = new Set(['admin', 'super_admin']);
 
@@ -59,7 +62,17 @@ router.get('/', authenticateToken, async (req, res) => {
     const { teacherId } = req.query;
 
     const query = {};
-    if (teacherId) {
+    if (req.user?.role === 'teacher') {
+      query.teacher_id = req.user.id;
+    } else if (req.user?.role === 'student') {
+      const student = await Student.findById(req.user.id).select('trade level').lean();
+      if (!student) {
+        return res.status(404).json({ success: false, message: 'Student not found' });
+      }
+
+      query.trade = normalizeTradeValue(student.trade);
+      query.level = normalizeLevelValue(student.level);
+    } else if (teacherId) {
       query.teacher_id = teacherId;
     }
 
@@ -130,13 +143,12 @@ router.post(
       const teacherId = req.user.id;
 
       if (req.user?.role === 'teacher') {
-        const teacher = await Teacher.findById(teacherId).select('trade').lean();
+        const teacher = await Teacher.findById(teacherId).select('trade trades level levels').lean();
         if (!teacher) throw new Error('Teacher not found');
-        
-        if (teacher.trade !== trade) {
+        if (!getTeacherTrades(teacher).includes(trade) || !getTeacherLevels(teacher).includes(level)) {
           return res.status(403).json({
             success: false,
-            message: 'You can only create exams for your assigned trade'
+            message: 'You can only create exams for your assigned trades and classes'
           });
         }
       }
@@ -210,11 +222,11 @@ router.put(
           return res.status(403).json({ success: false, message: 'You can only update your own exams' });
         }
 
-        const teacher = await Teacher.findById(req.user.id).select('trade').lean();
-        if (teacher && teacher.trade !== trade) {
+        const teacher = await Teacher.findById(req.user.id).select('trade trades level levels').lean();
+        if (teacher && (!getTeacherTrades(teacher).includes(trade) || !getTeacherLevels(teacher).includes(level))) {
           return res.status(403).json({
             success: false,
-            message: 'You can only assign exams to your own trade'
+            message: 'You can only assign exams to your own trades and classes'
           });
         }
       }
@@ -270,6 +282,23 @@ router.get('/:id/questions', authenticateToken, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Exam not found' });
     }
 
+    if (req.user?.role === 'student') {
+      const student = await Student.findById(req.user.id).select('trade level').lean();
+      if (!student) {
+        return res.status(404).json({ success: false, message: 'Student not found' });
+      }
+
+      const studentTrade = normalizeTradeValue(student.trade);
+      const studentLevel = normalizeLevelValue(student.level);
+
+      if (normalizeTradeValue(exam.trade) !== studentTrade || normalizeLevelValue(exam.level) !== studentLevel) {
+        return res.status(403).json({
+          success: false,
+          message: 'This exam is not assigned to your trade and class',
+        });
+      }
+    }
+
     const questionRows = await Question.find({ exam_id: examId }).sort({ _id: 1 }).lean();
 
     const questions = questionRows.map((row) => normalizeQuestion(row, false));
@@ -309,6 +338,10 @@ router.get('/:id/manage', authenticateToken, ensureStaff, async (req, res) => {
     const exam = await Exam.findById(examId).lean();
     if (!exam) {
       return res.status(404).json({ success: false, message: 'Exam not found' });
+    }
+
+    if (req.user?.role === 'teacher' && String(exam.teacher_id) !== String(req.user.id)) {
+      return res.status(403).json({ success: false, message: 'You can only manage your own exams' });
     }
 
     const questionRows = await Question.find({ exam_id: examId }).sort({ _id: 1 }).lean();

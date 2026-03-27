@@ -5,6 +5,7 @@ const Teacher = require('../models/Teacher');
 const Student = require('../models/Student');
 const { authenticateToken } = require('../middleware/auth');
 const { body, validationResult } = require('express-validator');
+const { getTeacherTrades } = require('../utils/teacherAssignments');
 
 const ensureTeacher = (req, res, next) => {
     if (!req.user || req.user.role !== 'teacher') {
@@ -61,20 +62,21 @@ router.get('/history', authenticateToken, ensureTeacher, async (req, res) => {
     try {
         const { date, student_id } = req.query;
 
-        const teacher = await Teacher.findById(req.user.id).select('trade').lean();
+        const teacher = await Teacher.findById(req.user.id).select('trade trades').lean();
         if (!teacher) throw new Error('Teacher not found');
+        const trades = getTeacherTrades(teacher);
 
         let studentIdsToQuery = [];
         
         if (student_id) {
             // Verify student is in teacher's trade
-            const student = await Student.findOne({ _id: student_id, trade: teacher.trade }).lean();
+            const student = await Student.findOne({ _id: student_id, trade: { $in: trades } }).lean();
             if (student) {
                 studentIdsToQuery.push(student._id);
             }
         } else {
             // Get all students in teacher's trade
-            const studentsInTrade = await Student.find({ trade: teacher.trade }).select('_id').lean();
+            const studentsInTrade = await Student.find({ trade: { $in: trades } }).select('_id').lean();
             studentIdsToQuery = studentsInTrade.map(s => s._id);
         }
 

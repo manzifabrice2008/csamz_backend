@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const Student = require('../models/Student');
 const { authenticateToken } = require('../middleware/auth');
+const { normalizeTradeValue, normalizeLevelValue, normalizeStudentRecord } = require('../utils/studentClassification');
 require('dotenv').config();
 
 const STUDENT_JWT_EXPIRY = '30d';
@@ -22,6 +23,7 @@ router.post('/register',
       .isLength({ min: 7, max: 20 })
       .withMessage('Phone number length looks invalid'),
     body('trade').trim().notEmpty().withMessage('Trade is required'),
+    body('level').isIn(['L3', 'L4', 'L5']).withMessage('Valid level is required'),
   ],
   async (req, res) => {
     try {
@@ -30,7 +32,9 @@ router.post('/register',
         return res.status(400).json({ success: false, errors: errors.array() });
       }
 
-      const { username, password, full_name, email, phone_number, trade } = req.body;
+      const { username, password, full_name, email, phone_number } = req.body;
+      const trade = normalizeTradeValue(req.body.trade);
+      const level = normalizeLevelValue(req.body.level);
 
       const orQuery = [{ username }];
       if (email) orQuery.push({ email });
@@ -50,11 +54,12 @@ router.post('/register',
         full_name,
         email: email || undefined,
         phone_number,
-        trade
+        trade,
+        level,
       });
 
       const token = jwt.sign(
-        { id: result._id, role: 'student', username, full_name, trade },
+        { id: result._id, role: 'student', username, full_name, trade, level },
         process.env.JWT_SECRET,
         { expiresIn: STUDENT_JWT_EXPIRY }
       );
@@ -70,6 +75,7 @@ router.post('/register',
           email: result.email || null,
           phone_number,
           trade,
+          level,
           role: 'student',
         },
       });
@@ -109,21 +115,31 @@ router.post('/login',
       }
 
       const token = jwt.sign(
-        { id: student._id, role: 'student', username: student.username, trade: student.trade },
+        {
+          id: student._id,
+          role: 'student',
+          username: student.username,
+          trade: normalizeTradeValue(student.trade),
+          level: normalizeLevelValue(student.level),
+        },
         process.env.JWT_SECRET,
         { expiresIn: STUDENT_JWT_EXPIRY }
       );
+
+      const normalizedStudent = normalizeStudentRecord(student.toObject());
 
       res.json({
         success: true,
         message: 'Login successful',
         token,
         student: {
-          id: student._id,
-          username: student.username,
-          full_name: student.full_name,
-          email: student.email,
-          trade: student.trade,
+          id: normalizedStudent._id,
+          username: normalizedStudent.username,
+          full_name: normalizedStudent.full_name,
+          email: normalizedStudent.email,
+          phone_number: normalizedStudent.phone_number,
+          trade: normalizedStudent.trade,
+          level: normalizedStudent.level,
           role: 'student',
         },
       });
@@ -140,21 +156,26 @@ router.get('/me', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    const student = await Student.findById(req.user.id).select('_id username full_name email status trade');
+    const student = await Student.findById(req.user.id).select('_id username full_name email phone_number status trade level createdAt');
 
     if (!student) {
       return res.status(404).json({ success: false, message: 'Student not found' });
     }
 
+    const normalizedStudent = normalizeStudentRecord(student.toObject());
+
     res.json({ 
       success: true, 
       student: {
-        id: student._id,
-        username: student.username,
-        full_name: student.full_name,
-        email: student.email,
-        status: student.status,
-        trade: student.trade
+        id: normalizedStudent._id,
+        username: normalizedStudent.username,
+        full_name: normalizedStudent.full_name,
+        email: normalizedStudent.email,
+        phone_number: normalizedStudent.phone_number,
+        status: normalizedStudent.status,
+        trade: normalizedStudent.trade,
+        level: normalizedStudent.level,
+        created_at: student.createdAt
       }
     });
   } catch (error) {

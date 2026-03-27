@@ -26,12 +26,22 @@ const studentSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+  level: {
+    type: String,
+    enum: ['L3', 'L4', 'L5'],
+    required: true,
+    default: 'L3',
+  },
+  phone_number: {
+    type: String,
+    trim: true,
+    required: true,
+  },
   status: {
     type: String,
     enum: ['active', 'inactive'],
     default: 'active',
   },
-  // fields might be missing here if Supabase had more.
 }, { timestamps: true });
 
 module.exports = mongoose.model('Student', studentSchema);

@@ -26,11 +26,48 @@ router.get('/stats', authenticateToken, async (req, res) => {
         const student = await Student.findById(studentId).select('trade level').lean();
         
         let assignmentCompletion = 0;
+        let classRank = null;
+        let classSize = 0;
         if (student) {
             const { trade, level } = student;
             const totalAssignments = await Assignment.countDocuments({ trade, level });
             const submittedAssignments = await Submission.countDocuments({ student_id: studentId });
             assignmentCompletion = totalAssignments > 0 ? Math.round((submittedAssignments / totalAssignments) * 100) : 0;
+
+            const classmates = await Student.find({ trade, level, status: 'active' }).select('_id').lean();
+            classSize = classmates.length;
+
+            const classmateIds = classmates.map((row) => row._id);
+            const classResults = await Result.find({ student_id: { $in: classmateIds } })
+                .populate('exam_id', 'total_marks')
+                .select('student_id score exam_id submitted_at createdAt')
+                .lean();
+
+            const totalsByStudent = new Map();
+
+            classResults.forEach((row) => {
+                const totalMarks = row.exam_id?.total_marks || 0;
+                const percentage = totalMarks > 0 ? (row.score / totalMarks) * 100 : 0;
+                const key = String(row.student_id);
+                const current = totalsByStudent.get(key) || { totalPercentage: 0, exams: 0 };
+                current.totalPercentage += percentage;
+                current.exams += 1;
+                totalsByStudent.set(key, current);
+            });
+
+            const rankedStudents = classmates
+                .map((classmate) => {
+                    const totals = totalsByStudent.get(String(classmate._id)) || { totalPercentage: 0, exams: 0 };
+                    const averagePercentage = totals.exams > 0 ? totals.totalPercentage / totals.exams : 0;
+                    return {
+                        student_id: String(classmate._id),
+                        averagePercentage: Math.round(averagePercentage),
+                    };
+                })
+                .sort((a, b) => b.averagePercentage - a.averagePercentage);
+
+            const currentStudentIndex = rankedStudents.findIndex((row) => row.student_id === String(studentId));
+            classRank = currentStudentIndex >= 0 ? currentStudentIndex + 1 : null;
         }
 
         // 3. Average Grades (Exams)
@@ -44,6 +81,8 @@ router.get('/stats', authenticateToken, async (req, res) => {
                 attendance: attendanceRate,
                 assignments: assignmentCompletion,
                 grades: averageGrade,
+                class_rank: classRank,
+                class_size: classSize,
                 total_attendance_days: totalDays,
                 present_attendance_days: presentDays
             }
