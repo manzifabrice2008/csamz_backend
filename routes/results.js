@@ -76,6 +76,8 @@ const buildAverageLeaderboard = (rows) => {
     }));
 };
 
+const areGradesPublished = (examLike) => Boolean(examLike?.grades_published_at);
+
 router.get('/history', authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== 'student') {
@@ -85,14 +87,14 @@ router.get('/history', authenticateToken, async (req, res) => {
     const studentId = req.user.id;
 
     const results = await Result.find({ student_id: studentId })
-      .populate('exam_id', 'title total_marks trade level')
+      .populate('exam_id', 'title total_marks trade level grades_published_at')
       .sort({ submitted_at: -1 })
       .lean();
 
     const examIds = [...new Set(results.map((row) => String(row.exam_id?._id)).filter(Boolean))];
     const examResultRows = await Result.find({ exam_id: { $in: examIds } })
       .populate('student_id', 'trade level')
-      .populate('exam_id', 'total_marks trade level')
+      .populate('exam_id', 'total_marks trade level grades_published_at')
       .select('student_id exam_id score submitted_at createdAt')
       .lean();
 
@@ -101,6 +103,7 @@ router.get('/history', authenticateToken, async (req, res) => {
     examIds.forEach((examId) => {
       const relatedRows = examResultRows
         .filter((row) => String(row.exam_id?._id || row.exam_id) === examId)
+        .filter((row) => areGradesPublished(row.exam_id))
         .filter((row) => {
           const examTrade = row.exam_id?.trade;
           const examLevel = row.exam_id?.level;
@@ -128,9 +131,10 @@ router.get('/history', authenticateToken, async (req, res) => {
         totalMarks: total_marks,
         percentage: Math.round(percentage),
         grade: getGrade(row.score, total_marks),
-        rank: ranksByResultId.get(String(row._id)) || null,
+        rank: areGradesPublished(row.exam_id) ? (ranksByResultId.get(String(row._id)) || null) : null,
         trade: row.exam_id?.trade || null,
         level: row.exam_id?.level || null,
+        gradesPublished: areGradesPublished(row.exam_id),
         submittedAt: row.submitted_at || row.createdAt
       };
     });
@@ -164,12 +168,12 @@ router.get('/class-summary', authenticateToken, async (req, res) => {
     const classmateIds = classmates.map((row) => row._id);
     const classResults = await Result.find({ student_id: { $in: classmateIds } })
       .populate('student_id', 'full_name username')
-      .populate('exam_id', 'title total_marks trade level')
+      .populate('exam_id', 'title total_marks trade level grades_published_at')
       .select('student_id exam_id score submitted_at createdAt')
       .lean();
 
     const normalizedResults = classResults
-      .filter((row) => row.exam_id)
+      .filter((row) => row.exam_id && areGradesPublished(row.exam_id))
       .map((row) => {
         const totalMarks = row.exam_id?.total_marks || 0;
         const percentage = totalMarks > 0 ? Math.round((row.score / totalMarks) * 100) : 0;
@@ -181,6 +185,16 @@ router.get('/class-summary', authenticateToken, async (req, res) => {
           subject: row.exam_id?.trade || 'General',
         };
       });
+
+    if (!normalizedResults.length) {
+      return res.json({
+        success: true,
+        has_published_grades: false,
+        summary: null,
+        subjects: [],
+        leaderboard: [],
+      });
+    }
 
     const overallLeaderboard = buildAverageLeaderboard(normalizedResults);
     const currentStudentOverall = overallLeaderboard.find((row) => row.student_id === String(studentId));
@@ -210,6 +224,7 @@ router.get('/class-summary', authenticateToken, async (req, res) => {
 
     res.json({
       success: true,
+      has_published_grades: true,
       summary: {
         trade: student.trade,
         level: student.level,
@@ -288,19 +303,22 @@ router.get('/:studentId/:examId', authenticateToken, async (req, res) => {
         : formattedAnswers.reduce((sum, row) => sum + (row.marks || 0), 0);
 
     const percentage = totalMarks > 0 ? (result.score / totalMarks) * 100 : 0;
+    const gradesPublished = areGradesPublished(exam);
     const examResults = await Result.find({ exam_id: examId })
       .populate('student_id', 'full_name username trade level')
       .select('student_id score submitted_at createdAt')
       .lean();
 
-    const rankedClassResults = getRankedRows(
-      examResults
-        .filter((row) => row.student_id?.trade === exam.trade && row.student_id?.level === exam.level)
-        .map((row) => ({
-          ...row,
-          percentage: totalMarks > 0 ? Math.round((row.score / totalMarks) * 100) : 0,
-        }))
-    );
+    const rankedClassResults = gradesPublished || isStaffViewer
+      ? getRankedRows(
+          examResults
+            .filter((row) => row.student_id?.trade === exam.trade && row.student_id?.level === exam.level)
+            .map((row) => ({
+              ...row,
+              percentage: totalMarks > 0 ? Math.round((row.score / totalMarks) * 100) : 0,
+            }))
+        )
+      : [];
 
     const rank = rankedClassResults.findIndex((row) => String(row.student_id?._id || row.student_id) === String(studentId)) + 1;
     const ranking = rankedClassResults.map((row, index) => ({
@@ -321,6 +339,8 @@ router.get('/:studentId/:examId', authenticateToken, async (req, res) => {
         title: exam.title,
         description: exam.description,
         total_marks: totalMarks,
+        grades_published: gradesPublished,
+        grades_published_at: exam.grades_published_at || null,
       },
       result: {
         student_id: studentId,
@@ -329,7 +349,7 @@ router.get('/:studentId/:examId', authenticateToken, async (req, res) => {
         total_marks: totalMarks,
         percentage: Math.round(percentage),
         grade: getGrade(result.score, totalMarks),
-        rank: rank || null,
+        rank: gradesPublished || isStaffViewer ? (rank || null) : null,
         submitted_at: result.submitted_at || result.createdAt,
       },
       ranking,

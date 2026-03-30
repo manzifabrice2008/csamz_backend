@@ -88,6 +88,7 @@ app.use('/api/teacher/stats', teacherStatsRoutes);
 app.use('/api/teacher/students', teacherStudentsRoutes);
 app.use('/api/teacher/assignments', teacherAssignmentsRoutes);
 app.use('/api/teacher/attendance', teacherAttendanceRoutes);
+app.use('/api/teacher/exams', examsRoutes);
 app.use('/api/blog', blogRoutes);
 app.use('/api/transfers', institutionTransfersRoutes);
 app.use('/api/exams', examsRoutes);

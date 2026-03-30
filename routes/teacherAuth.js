@@ -26,6 +26,8 @@ const isAdminUser = (user) => {
   return user.role === 'admin' || user.role === 'super_admin';
 };
 
+const getTeacherPublishPermission = (teacher) => teacher?.can_publish_marks !== false;
+
 router.post(
   '/register',
   [
@@ -81,7 +83,8 @@ router.post(
         trades,
         level,
         levels,
-        status: 'pending'
+        status: 'pending',
+        can_publish_marks: true,
       });
 
       res.status(201).json({
@@ -98,6 +101,7 @@ router.post(
           levels,
           role: 'teacher',
           status: 'pending',
+          can_publish_marks: true,
         },
       });
     } catch (error) {
@@ -176,6 +180,7 @@ router.post(
           levels: getTeacherLevels(teacher),
           role: 'teacher',
           status: teacher.status,
+          can_publish_marks: getTeacherPublishPermission(teacher),
         },
       });
     } catch (error) {
@@ -191,7 +196,7 @@ router.get('/me', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    const teacher = await Teacher.findById(req.user.id).select('_id full_name username email trade trades level levels status createdAt');
+    const teacher = await Teacher.findById(req.user.id).select('_id full_name username email trade trades level levels status can_publish_marks createdAt');
 
     if (!teacher) {
       return res.status(404).json({ success: false, message: 'Teacher not found' });
@@ -210,6 +215,7 @@ router.get('/me', authenticateToken, async (req, res) => {
         levels: getTeacherLevels(teacher),
         role: 'teacher',
         status: teacher.status,
+        can_publish_marks: getTeacherPublishPermission(teacher),
         created_at: teacher.createdAt
       } 
     });
@@ -316,6 +322,7 @@ router.patch(
           levels: getTeacherLevels(teacher),
           role: 'teacher',
           status: teacher.status,
+          can_publish_marks: getTeacherPublishPermission(teacher),
         },
       });
     } catch (error) {
@@ -376,7 +383,7 @@ router.get('/admin/list', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Only admins can view teachers' });
     }
 
-    const teachers = await Teacher.find().select('_id full_name username email trade trades level levels status createdAt').sort({ createdAt: -1 });
+    const teachers = await Teacher.find().select('_id full_name username email trade trades level levels status can_publish_marks createdAt').sort({ createdAt: -1 });
 
     const formattedTeachers = teachers.map(t => ({
       id: t._id,
@@ -389,6 +396,7 @@ router.get('/admin/list', authenticateToken, async (req, res) => {
       levels: getTeacherLevels(t),
       role: 'teacher',
       status: t.status,
+      can_publish_marks: getTeacherPublishPermission(t),
       created_at: t.createdAt
     }));
 
@@ -444,6 +452,48 @@ router.patch(
     } catch (error) {
       console.error('Update teacher status error:', error);
       res.status(500).json({ success: false, message: 'Server error' });
+    }
+  }
+);
+
+router.patch(
+  '/admin/:id/publish-permission',
+  authenticateToken,
+  [body('can_publish_marks').isBoolean().withMessage('Publish permission must be true or false')],
+  async (req, res) => {
+    try {
+      if (!isAdminUser(req.user)) {
+        return res.status(403).json({ success: false, message: 'Only admins can change teacher publish permission' });
+      }
+
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const teacher = await Teacher.findByIdAndUpdate(
+        req.params.id,
+        { can_publish_marks: req.body.can_publish_marks },
+        { new: true }
+      );
+
+      if (!teacher) {
+        return res.status(404).json({ success: false, message: 'Teacher not found' });
+      }
+
+      res.json({
+        success: true,
+        message: req.body.can_publish_marks
+          ? 'Teacher can now publish marks for the whole class'
+          : 'Teacher can no longer publish marks for the whole class',
+        teacher: {
+          id: teacher._id,
+          can_publish_marks: getTeacherPublishPermission(teacher),
+        },
+      });
+    } catch (error) {
+      console.error('Update teacher publish permission error:', error);
+      res.status(500).json({ success: false, message: 'Server error while updating publish permission' });
     }
   }
 );

@@ -6,6 +6,7 @@ const Question = require('../models/Question');
 const Result = require('../models/Result');
 const StudentAnswer = require('../models/StudentAnswer');
 const Teacher = require('../models/Teacher');
+const Notification = require('../models/Notification');
 const { authenticateToken } = require('../middleware/auth');
 const { getTeacherTrades, getTeacherLevels } = require('../utils/teacherAssignments');
 const Student = require('../models/Student');
@@ -65,6 +66,11 @@ const normalizeQuestion = (row, includeAnswer = true) => ({
   correct_answer: includeAnswer ? row.correct_answer : undefined,
   marks: row.marks,
   time_limit: row.time_limit || 30,
+});
+
+const buildGradesPublishedPayload = (exam) => ({
+  grades_published: Boolean(exam?.grades_published_at),
+  grades_published_at: exam?.grades_published_at || null,
 });
 
 router.get('/', authenticateToken, async (req, res) => {
@@ -681,6 +687,7 @@ router.get('/:id/results', authenticateToken, ensureStaff, async (req, res) => {
     res.json({
       success: true,
       exam_title: exam.title,
+      ...buildGradesPublishedPayload(exam),
       results: resultsWithGrades,
       stats: {
         total_submissions: totalSubmissions,
@@ -693,6 +700,92 @@ router.get('/:id/results', authenticateToken, ensureStaff, async (req, res) => {
   } catch (error) {
     console.error('List exam results error:', error);
     res.status(500).json({ success: false, message: 'Failed to load results' });
+  }
+});
+
+router.patch('/:id/results/publish', authenticateToken, ensureStaff, async (req, res) => {
+  try {
+    const examId = req.params.id;
+
+    const exam = await Exam.findById(examId).lean();
+    if (!exam) {
+      return res.status(404).json({ success: false, message: 'Exam not found' });
+    }
+
+    if (req.user?.role === 'teacher' && String(exam.teacher_id) !== String(req.user.id)) {
+      return res.status(403).json({ success: false, message: 'You can only publish grades for your own exams' });
+    }
+
+    if (req.user?.role === 'teacher') {
+      const teacher = await Teacher.findById(req.user.id).select('can_publish_marks').lean();
+      if (!teacher) {
+        return res.status(404).json({ success: false, message: 'Teacher account not found' });
+      }
+
+      if (teacher.can_publish_marks === false) {
+        return res.status(403).json({
+          success: false,
+          message: 'Your admin has disabled permission to publish marks for the whole class',
+        });
+      }
+    }
+
+    const results = await Result.find({ exam_id: examId })
+      .populate('student_id', 'full_name')
+      .lean();
+
+    if (!results.length) {
+      return res.status(400).json({ success: false, message: 'No submitted grades are available to publish yet' });
+    }
+
+    const alreadyPublished = Boolean(exam.grades_published_at);
+    const publishedAt = exam.grades_published_at || new Date();
+
+    const updated = alreadyPublished
+      ? exam
+      : await Exam.findByIdAndUpdate(
+          examId,
+          {
+            grades_published_at: publishedAt,
+            grades_published_by: req.user.id,
+          },
+          { new: true }
+        ).lean();
+
+    if (!alreadyPublished) {
+      const studentNotifications = results
+        .filter((row) => row.student_id?._id)
+        .map((row) => ({
+          user_id: row.student_id._id,
+          user_type: 'student',
+          title: 'Grades published',
+          message: `Grades for "${updated.title}" are now published. You can now see the class ranking and other students' grades.`,
+          type: 'success',
+        }));
+
+      const teacherNotification = {
+        user_id: req.user.id,
+        user_type: req.user.role === 'super_admin' ? 'admin' : req.user.role,
+        title: 'Grades published successfully',
+        message: `You published grades for "${updated.title}". Students can now see the class ranking immediately.`,
+        type: 'success',
+      };
+
+      await Notification.insertMany([...studentNotifications, teacherNotification]);
+    }
+
+    res.json({
+      success: true,
+      message: alreadyPublished ? 'Grades were already published for this exam' : 'Grades published successfully',
+      exam: {
+        id: updated._id,
+        title: updated.title,
+        ...buildGradesPublishedPayload(updated),
+      },
+    });
+  } catch (error) {
+    console.error('Publish grades error:', error);
+    res.status(500).json({ success: false, message: 'Failed to publish grades' });
   }
 });
 
